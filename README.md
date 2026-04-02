@@ -1,3 +1,20 @@
+# FastIPC
+
+## Upstream and Attribution
+
+FastIPC is a deep derivative of
+[kyr0/libsharedmemory](https://github.com/kyr0/libsharedmemory), pinned at
+9e24caaefb28826e99a33be2dd1350725558dd80 and distributed under MIT. The
+original history, LICENSE, copyright notices, and Boost Software License notice
+in test/lest.hpp are preserved.
+
+The baseline supplies the initial named-memory wrapper, legacy streams/queue,
+and build scaffold. FastIPC is redesigning Linux mapping lifecycle, layout,
+synchronization, blocking, liveness/restart, transport API, tests, and
+performance engineering. docs/upstream-analysis.md records the exact boundary.
+
+The remainder is the imported upstream README. It describes the baseline, not
+yet every target capability.
 # libsharedmemory
 
 A lightweight, header-only C++20 library for inter-process communication via shared memory. Transfer data between isolated OS processes - or between modules written in different programming languages - with a simple, cross-platform API.
