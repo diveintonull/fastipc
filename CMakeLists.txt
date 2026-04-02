@@ -1,32 +1,60 @@
-cmake_minimum_required(VERSION 3.12)
-cmake_policy(SET CMP0042 NEW)
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+cmake_minimum_required(VERSION 3.20)
 
-project(LSM)
+project(FastIPC VERSION 0.1.0 LANGUAGES CXX)
 
-set(header_files ${CMAKE_CURRENT_SOURCE_DIR}/include/libsharedmemory/libsharedmemory.hpp)
+include(CTest)
+find_package(Threads REQUIRED)
 
-add_library(lsm INTERFACE)
-target_sources(lsm INTERFACE "$<BUILD_INTERFACE:${header_files}>")
+option(FASTIPC_BUILD_TESTS "Build FastIPC behavior tests" ON)
+option(FASTIPC_BUILD_LEGACY "Expose the imported libsharedmemory target" OFF)
 
-target_include_directories(lsm INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/>)
-target_include_directories(lsm SYSTEM INTERFACE $<INSTALL_INTERFACE:$<INSTALL_PREFIX>/include>)
+add_library(
+    fastipc
+    STATIC
+        src/shared_memory_transport.cpp
+        src/status.cpp)
+add_library(FastIPC::fastipc ALIAS fastipc)
+target_compile_features(fastipc PUBLIC cxx_std_20)
+target_include_directories(
+    fastipc
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-if (MSVC)
-    target_compile_options(lsm INTERFACE /W3 /EHsc /std:c++20)
-else()
-    target_compile_options(lsm INTERFACE -Wall -Wno-missing-braces -std=c++20 -fPIC)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(
+        fastipc
+        PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wconversion
+            -Wsign-conversion)
 endif()
 
-option(LSM_BUILD_TEST "build test" ON)
-if(${LSM_BUILD_TEST} AND (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))
-    enable_testing()
-    add_subdirectory(test/)
+if(FASTIPC_BUILD_LEGACY)
+    add_library(fastipc_upstream_legacy INTERFACE)
+    target_compile_features(fastipc_upstream_legacy INTERFACE cxx_std_20)
+    target_include_directories(
+        fastipc_upstream_legacy
+        INTERFACE
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 endif()
 
-option(LSM_BUILD_EXAMPLES "build examples" ON)
-if(${LSM_BUILD_EXAMPLES} AND (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))
-    add_subdirectory(example/)
+if(BUILD_TESTING AND FASTIPC_BUILD_TESTS)
+    add_executable(fastipc_tests tests/transport_test.cpp)
+    target_link_libraries(fastipc_tests PRIVATE FastIPC::fastipc Threads::Threads)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            fastipc_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+                -Wconversion
+                -Wsign-conversion)
+    endif()
+    add_test(NAME fastipc.transport COMMAND fastipc_tests)
 endif()
