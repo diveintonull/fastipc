@@ -6,6 +6,8 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <climits>
+#include <ctime>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -18,9 +20,11 @@
 #include <utility>
 
 #include <fcntl.h>
+#include <linux/futex.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 namespace fastipc {
@@ -28,6 +32,9 @@ namespace {
 
 using detail::SharedLayout;
 using detail::SlotHeader;
+
+static_assert(__atomic_always_lock_free(sizeof(std::uint32_t), nullptr));
+static_assert(__atomic_always_lock_free(sizeof(std::uint64_t), nullptr));
 
 enum class Role : std::uint8_t {
   Producer,
@@ -47,6 +54,82 @@ void AtomicStore(T* address, T value, int order) noexcept {
 template <typename T>
 T AtomicFetchAdd(T* address, T value, int order) noexcept {
   return __atomic_fetch_add(address, value, order);
+}
+
+enum class FutexWaitResult : std::uint8_t {
+  Woken,
+  ValueChanged,
+  Interrupted,
+  TimedOut,
+  Error,
+};
+
+struct FutexWaitOutcome {
+  FutexWaitResult result{FutexWaitResult::Error};
+  int error{0};
+};
+
+[[nodiscard]] timespec ToMonotonicAbsoluteTime(
+    const Deadline& deadline) noexcept {
+  timespec kernel_now{};
+  static_cast<void>(::clock_gettime(CLOCK_MONOTONIC, &kernel_now));
+
+  auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      deadline.time_point() - Deadline::Clock::now());
+  if (remaining < std::chrono::nanoseconds::zero()) {
+    remaining = std::chrono::nanoseconds::zero();
+  }
+
+  constexpr std::int64_t nanoseconds_per_second = 1'000'000'000;
+  const auto remaining_count = remaining.count();
+  const auto added_seconds = remaining_count / nanoseconds_per_second;
+  const auto added_nanoseconds = remaining_count % nanoseconds_per_second;
+  const auto combined_nanoseconds =
+      static_cast<std::int64_t>(kernel_now.tv_nsec) + added_nanoseconds;
+
+  timespec absolute{};
+  absolute.tv_sec = static_cast<time_t>(
+      static_cast<std::int64_t>(kernel_now.tv_sec) + added_seconds +
+      combined_nanoseconds / nanoseconds_per_second);
+  absolute.tv_nsec =
+      static_cast<long>(combined_nanoseconds % nanoseconds_per_second);
+  return absolute;
+}
+
+[[nodiscard]] FutexWaitOutcome FutexWait(
+    std::uint32_t* epoch, std::uint32_t expected,
+    const Deadline& deadline) noexcept {
+  timespec absolute{};
+  const timespec* timeout = nullptr;
+  if (!deadline.infinite()) {
+    absolute = ToMonotonicAbsoluteTime(deadline);
+    timeout = &absolute;
+  }
+
+  errno = 0;
+  const long result =
+      ::syscall(SYS_futex, epoch, FUTEX_WAIT_BITSET, expected, timeout,
+                nullptr, FUTEX_BITSET_MATCH_ANY);
+  if (result == 0) {
+    return {FutexWaitResult::Woken, 0};
+  }
+
+  const int error = errno;
+  switch (error) {
+    case EAGAIN:
+      return {FutexWaitResult::ValueChanged, error};
+    case EINTR:
+      return {FutexWaitResult::Interrupted, error};
+    case ETIMEDOUT:
+      return {FutexWaitResult::TimedOut, error};
+    default:
+      return {FutexWaitResult::Error, error};
+  }
+}
+
+void FutexWake(std::uint32_t* epoch) noexcept {
+  static_cast<void>(
+      ::syscall(SYS_futex, epoch, FUTEX_WAKE, INT_MAX, nullptr, nullptr, 0));
 }
 
 [[nodiscard]] std::uint64_t MonotonicNanoseconds() noexcept {
@@ -446,16 +529,21 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
     return Status(StatusCode::RoleConflict,
                   "consumer endpoint cannot send");
   }
+
   auto& layout = *impl_->layout;
   if (message.size() > layout.queue.max_message_size) {
     return Status(StatusCode::MessageTooLarge);
   }
 
-  const auto head =
-      AtomicLoad(&layout.producer_cursor.head, __ATOMIC_RELAXED);
-  const auto tail =
-      AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_ACQUIRE);
-  if (head - tail >= layout.queue.slot_count) {
+  std::uint64_t head = 0;
+  for (;;) {
+    head = AtomicLoad(&layout.producer_cursor.head, __ATOMIC_RELAXED);
+    const auto tail =
+        AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_ACQUIRE);
+    if (head - tail < layout.queue.slot_count) {
+      break;
+    }
+
     if (options.policy == BackpressurePolicy::Drop) {
       AtomicFetchAdd(&layout.producer_cursor.dropped_messages,
                      std::uint64_t{1}, __ATOMIC_RELAXED);
@@ -466,8 +554,29 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
                      std::uint64_t{1}, __ATOMIC_RELAXED);
       return Status(StatusCode::Timeout);
     }
-    return Status(StatusCode::WouldBlock,
-                  "futex blocking is added by the next vertical slice");
+
+    const auto expected_epoch =
+        AtomicLoad(&layout.consumer_cursor.space_epoch, __ATOMIC_ACQUIRE);
+    const auto rechecked_head =
+        AtomicLoad(&layout.producer_cursor.head, __ATOMIC_RELAXED);
+    const auto rechecked_tail =
+        AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_ACQUIRE);
+    if (rechecked_head - rechecked_tail < layout.queue.slot_count) {
+      continue;
+    }
+
+    const auto wait =
+        FutexWait(&layout.consumer_cursor.space_epoch, expected_epoch,
+                  options.deadline);
+    if (wait.result == FutexWaitResult::TimedOut) {
+      AtomicFetchAdd(&layout.producer_cursor.timeout_count,
+                     std::uint64_t{1}, __ATOMIC_RELAXED);
+      return Status(StatusCode::Timeout);
+    }
+    if (wait.result == FutexWaitResult::Error) {
+      return Status(StatusCode::IoError, "futex wait for queue space failed",
+                    wait.error);
+    }
   }
 
   SlotHeader* slot = SlotAt(&layout, head);
@@ -481,10 +590,13 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
   AtomicStore(&layout.producer_cursor.head, head + 1U, __ATOMIC_RELEASE);
   AtomicFetchAdd(&layout.producer_cursor.data_epoch, std::uint32_t{1},
                  __ATOMIC_RELEASE);
+  FutexWake(&layout.producer_cursor.data_epoch);
   AtomicFetchAdd(&layout.producer_cursor.sent_messages, std::uint64_t{1},
                  __ATOMIC_RELAXED);
-  layout.producer.heartbeat_monotonic_ns = MonotonicNanoseconds();
-  ++layout.producer.operation_sequence;
+  AtomicStore(&layout.producer.heartbeat_monotonic_ns, MonotonicNanoseconds(),
+              __ATOMIC_RELEASE);
+  AtomicFetchAdd(&layout.producer.operation_sequence, std::uint64_t{1},
+                 __ATOMIC_RELAXED);
   return Status::Ok();
 }
 
@@ -497,19 +609,43 @@ Result<std::size_t> SharedMemoryTransport::Receive(
     return Status(StatusCode::RoleConflict,
                   "producer endpoint cannot receive");
   }
+
   auto& layout = *impl_->layout;
-  const auto tail =
-      AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_RELAXED);
-  const auto head =
-      AtomicLoad(&layout.producer_cursor.head, __ATOMIC_ACQUIRE);
-  if (tail == head) {
+  std::uint64_t tail = 0;
+  for (;;) {
+    tail = AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_RELAXED);
+    const auto head =
+        AtomicLoad(&layout.producer_cursor.head, __ATOMIC_ACQUIRE);
+    if (tail != head) {
+      break;
+    }
     if (deadline.expired()) {
       AtomicFetchAdd(&layout.consumer_cursor.timeout_count,
                      std::uint64_t{1}, __ATOMIC_RELAXED);
       return Status(StatusCode::Timeout);
     }
-    return Status(StatusCode::WouldBlock,
-                  "futex blocking is added by the next vertical slice");
+
+    const auto expected_epoch =
+        AtomicLoad(&layout.producer_cursor.data_epoch, __ATOMIC_ACQUIRE);
+    const auto rechecked_tail =
+        AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_RELAXED);
+    const auto rechecked_head =
+        AtomicLoad(&layout.producer_cursor.head, __ATOMIC_ACQUIRE);
+    if (rechecked_tail != rechecked_head) {
+      continue;
+    }
+
+    const auto wait =
+        FutexWait(&layout.producer_cursor.data_epoch, expected_epoch, deadline);
+    if (wait.result == FutexWaitResult::TimedOut) {
+      AtomicFetchAdd(&layout.consumer_cursor.timeout_count,
+                     std::uint64_t{1}, __ATOMIC_RELAXED);
+      return Status(StatusCode::Timeout);
+    }
+    if (wait.result == FutexWaitResult::Error) {
+      return Status(StatusCode::IoError, "futex wait for queue data failed",
+                    wait.error);
+    }
   }
 
   SlotHeader* slot = SlotAt(&layout, tail);
@@ -523,6 +659,7 @@ Result<std::size_t> SharedMemoryTransport::Receive(
   if (destination.size() < length) {
     return Status(StatusCode::BufferTooSmall);
   }
+
   const auto* payload =
       reinterpret_cast<const std::byte*>(slot) + sizeof(SlotHeader);
   if (length != 0U) {
@@ -532,10 +669,13 @@ Result<std::size_t> SharedMemoryTransport::Receive(
   AtomicStore(&layout.consumer_cursor.tail, tail + 1U, __ATOMIC_RELEASE);
   AtomicFetchAdd(&layout.consumer_cursor.space_epoch, std::uint32_t{1},
                  __ATOMIC_RELEASE);
+  FutexWake(&layout.consumer_cursor.space_epoch);
   AtomicFetchAdd(&layout.consumer_cursor.received_messages, std::uint64_t{1},
                  __ATOMIC_RELAXED);
-  layout.consumer.heartbeat_monotonic_ns = MonotonicNanoseconds();
-  ++layout.consumer.operation_sequence;
+  AtomicStore(&layout.consumer.heartbeat_monotonic_ns, MonotonicNanoseconds(),
+              __ATOMIC_RELEASE);
+  AtomicFetchAdd(&layout.consumer.operation_sequence, std::uint64_t{1},
+                 __ATOMIC_RELAXED);
   return static_cast<std::size_t>(length);
 }
 
