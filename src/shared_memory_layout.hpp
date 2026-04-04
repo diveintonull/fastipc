@@ -10,7 +10,7 @@ namespace fastipc::detail {
 inline constexpr std::array<char, 8> kMagic{
     'F', 'A', 'S', 'T', 'I', 'P', 'C', '\0'};
 inline constexpr std::uint16_t kLayoutMajor = 1;
-inline constexpr std::uint16_t kLayoutMinor = 0;
+inline constexpr std::uint16_t kLayoutMinor = 1;
 inline constexpr std::uint32_t kEndianMarker = 0x01020304U;
 inline constexpr std::uint32_t kInitInitializing = 1;
 inline constexpr std::uint32_t kInitReady = 2;
@@ -35,9 +35,10 @@ struct alignas(kCacheLine) EndpointMetadata {
   std::uint32_t state{0};
   std::uint64_t process_start_ticks{0};
   std::uint64_t generation{0};
+  std::uint64_t role_token{0};
   std::uint64_t heartbeat_monotonic_ns{0};
   std::uint64_t operation_sequence{0};
-  std::array<std::byte, 24> reserved{};
+  std::array<std::byte, 16> reserved{};
 };
 static_assert(sizeof(EndpointMetadata) == kCacheLine);
 

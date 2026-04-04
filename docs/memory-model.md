@@ -35,6 +35,7 @@ by both peers.
 | header.generation | release store | acquire load | A replacement producer publishes a new session identity before endpoint ownership and messages. |
 | endpoint.pid | release | acquire | PID publication follows endpoint metadata initialization. |
 | endpoint.process_start_ticks | initialized before PID release | read after PID acquire | PID plus Linux start ticks distinguishes the original process from a recycled PID. |
+| endpoint.role_token | initialized before PID release | acquire at operation entry and heartbeat update | A new claim fences an older endpoint even when channel generation is unchanged. |
 | producer_cursor.head | relaxed load, release store | acquire load | Release publishes slot length, sequence, and payload; acquire makes them visible. Only the producer writes head. |
 | consumer_cursor.tail | relaxed load, release store | acquire load | Release publishes completion of the slot read; producer acquire prevents early reuse. Only the consumer writes tail. |
 | data_epoch | release fetch-add | acquire load | Orders the state transition before wakeup and provides a stable futex expected value. |
@@ -91,16 +92,27 @@ because each conversion derives from the original target.
 A blocked operation has two absolute deadlines: the caller's deadline and the
 next liveness probe. FastIPC waits until the earlier one. A liveness-probe
 timeout returns to the queue predicate instead of being reported as a caller
-timeout. The next loop checks the peer's released PID plus Linux process-start
-ticks; a missing PID is PeerUnavailable, while a vanished or recycled process
-identity is PeerDead.
+timeout. The next loop checks the peer's released PID, Linux process-start
+ticks, and heartbeat lease. A missing PID is PeerUnavailable; a vanished or recycled
+process identity, or an expired heartbeat, is PeerDead.
 
-SIGKILL cannot increment an epoch, so this bounded probe is what prevents an
-infinite futex sleep after a crash. Graceful Close clears PID with release
-ordering, increments the epoch observed by the peer, and wakes it immediately.
-Dead-role takeover remains outside the SPSC hot path and is serialized by the
-shared-memory descriptor's flock. Producer takeover increments the channel
-generation before publishing the new PID, fencing older producers.
+Every claimed endpoint owns one control-plane jthread. It refreshes heartbeat
+at clamp(peer_timeout / 4, 1 ms, 250 ms), including while the data plane is
+idle. The thread first verifies PID, start ticks, and role token, so it exits
+after another endpoint claims the role. Close requests stop, wakes the local
+condition variable, joins the heartbeat thread, and only then clears metadata
+and unmaps.
+
+SIGKILL cannot increment an epoch, so the bounded probe prevents an infinite
+futex sleep after a crash. Graceful Close clears PID with release ordering,
+increments the peer epoch, and wakes it immediately. Dead or expired role
+takeover remains outside the SPSC hot path and is serialized by flock. Producer
+takeover increments channel generation; all role takeovers publish a fresh
+role token. Send and Receive verify their token before touching the ring, so a
+resumed stale endpoint is rejected with StaleGeneration. This is cooperative
+fencing at operation boundaries; strict recovery from a process frozen after its
+final ownership check but before cursor publication would additionally require
+generation-tagged slots or cursors.
 
 ## Buffer and corruption semantics
 

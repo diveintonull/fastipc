@@ -12,9 +12,9 @@
 #include <string>
 #include <thread>
 #include <utility>
-#include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
 
@@ -519,6 +519,262 @@ int GracefulCloseWakesInfinitePeerWait() {
   return 0;
 }
 
+int StoppedProducerExpiresAndOldGenerationIsFenced() {
+  using namespace std::chrono_literals;
+  using fastipc::BackpressurePolicy;
+  using fastipc::Deadline;
+  using fastipc::SendOptions;
+  using fastipc::SharedMemoryTransport;
+  using fastipc::StatusCode;
+
+  auto config = ConfigFor("fastipc_stopped_producer");
+  config.unlink_on_owner_close = false;
+  config.peer_timeout = 100ms;
+
+  int ready_pipe[2]{-1, -1};
+  int command_pipe[2]{-1, -1};
+  int result_pipe[2]{-1, -1};
+  CHECK(::pipe(ready_pipe) == 0);
+  CHECK(::pipe(command_pipe) == 0);
+  CHECK(::pipe(result_pipe) == 0);
+  const pid_t child = ::fork();
+  CHECK(child >= 0);
+  if (child == 0) {
+    ::close(ready_pipe[0]);
+    ::close(command_pipe[1]);
+    ::close(result_pipe[0]);
+    auto producer_result = SharedMemoryTransport::CreateProducer(config);
+    if (!producer_result.ok()) {
+      ::_exit(30);
+    }
+    auto producer = std::move(producer_result).take_value();
+    const char ready = 'R';
+    if (::write(ready_pipe[1], &ready, 1) != 1) {
+      ::_exit(31);
+    }
+
+    char command = 0;
+    if (::read(command_pipe[0], &command, 1) != 1) {
+      ::_exit(32);
+    }
+    const std::array<std::byte, 1> stale_payload{std::byte{0x51}};
+    const auto stale_send =
+        producer->Send(stale_payload,
+                       SendOptions{BackpressurePolicy::Block,
+                                   Deadline::After(200ms)});
+    const auto code = static_cast<std::uint8_t>(stale_send.code());
+    if (::write(result_pipe[1], &code, sizeof(code)) !=
+        static_cast<ssize_t>(sizeof(code))) {
+      ::_exit(33);
+    }
+    producer->Close();
+    ::_exit(0);
+  }
+
+  ::close(ready_pipe[1]);
+  ::close(command_pipe[0]);
+  ::close(result_pipe[1]);
+  char ready = 0;
+  CHECK(::read(ready_pipe[0], &ready, 1) == 1);
+  ::close(ready_pipe[0]);
+  CHECK(ready == 'R');
+
+  auto consumer_result = SharedMemoryTransport::OpenConsumer(config);
+  CHECK(consumer_result.ok());
+  auto consumer = std::move(consumer_result).take_value();
+  const auto first_generation = consumer->generation();
+
+  CHECK(::kill(child, SIGSTOP) == 0);
+  int stop_status = 0;
+  CHECK(::waitpid(child, &stop_status, WUNTRACED) == child);
+  CHECK(WIFSTOPPED(stop_status));
+  std::this_thread::sleep_for(300ms);
+
+  auto replacement_config = config;
+  replacement_config.unlink_on_owner_close = true;
+  auto replacement_result =
+      SharedMemoryTransport::CreateProducer(replacement_config);
+  if (!replacement_result.ok()) {
+    static_cast<void>(::kill(child, SIGKILL));
+    static_cast<void>(::waitpid(child, nullptr, 0));
+  }
+  CHECK(replacement_result.ok());
+  auto replacement = std::move(replacement_result).take_value();
+  CHECK(replacement->generation() > first_generation);
+
+  const std::array<std::byte, 1> fresh_payload{std::byte{0xA4}};
+  CHECK(replacement
+            ->Send(fresh_payload,
+                   SendOptions{BackpressurePolicy::Block,
+                               Deadline::After(200ms)})
+            .ok());
+  std::array<std::byte, 64> destination{};
+  const auto fresh_receive =
+      consumer->Receive(destination, Deadline::After(200ms));
+  CHECK(fresh_receive.ok());
+  CHECK(destination[0] == fresh_payload[0]);
+
+  CHECK(::kill(child, SIGCONT) == 0);
+  const char command = 'S';
+  CHECK(::write(command_pipe[1], &command, 1) == 1);
+  ::close(command_pipe[1]);
+
+  std::uint8_t stale_code = 0;
+  CHECK(::read(result_pipe[0], &stale_code, sizeof(stale_code)) ==
+        static_cast<ssize_t>(sizeof(stale_code)));
+  ::close(result_pipe[0]);
+  int child_status = 0;
+  CHECK(::waitpid(child, &child_status, 0) == child);
+  CHECK(WIFEXITED(child_status));
+  CHECK(WEXITSTATUS(child_status) == 0);
+  CHECK(stale_code ==
+        static_cast<std::uint8_t>(StatusCode::StaleGeneration));
+  return 0;
+}
+
+int IdleHeartbeatsPreventFalseTakeover() {
+  using namespace std::chrono_literals;
+  using fastipc::SharedMemoryTransport;
+  using fastipc::StatusCode;
+
+  auto config = ConfigFor("fastipc_idle_heartbeat");
+  config.peer_timeout = 200ms;
+  auto producer_result = SharedMemoryTransport::CreateProducer(config);
+  CHECK(producer_result.ok());
+  auto producer = std::move(producer_result).take_value();
+  auto consumer_result = SharedMemoryTransport::OpenConsumer(config);
+  CHECK(consumer_result.ok());
+  auto consumer = std::move(consumer_result).take_value();
+
+  std::this_thread::sleep_for(600ms);
+  const auto duplicate_producer =
+      SharedMemoryTransport::CreateProducer(config);
+  CHECK(!duplicate_producer.ok());
+  CHECK(duplicate_producer.status().code() == StatusCode::RoleConflict);
+  const auto duplicate_consumer =
+      SharedMemoryTransport::OpenConsumer(config);
+  CHECK(!duplicate_consumer.ok());
+  CHECK(duplicate_consumer.status().code() == StatusCode::RoleConflict);
+  return 0;
+}
+
+int StoppedConsumerExpiresAndOldRoleIsFenced() {
+  using namespace std::chrono_literals;
+  using fastipc::BackpressurePolicy;
+  using fastipc::Deadline;
+  using fastipc::SendOptions;
+  using fastipc::SharedMemoryTransport;
+  using fastipc::StatusCode;
+
+  auto config = ConfigFor("fastipc_stopped_consumer");
+  config.peer_timeout = 100ms;
+
+  int start_pipe[2]{-1, -1};
+  int ready_pipe[2]{-1, -1};
+  int command_pipe[2]{-1, -1};
+  int result_pipe[2]{-1, -1};
+  CHECK(::pipe(start_pipe) == 0);
+  CHECK(::pipe(ready_pipe) == 0);
+  CHECK(::pipe(command_pipe) == 0);
+  CHECK(::pipe(result_pipe) == 0);
+  const pid_t child = ::fork();
+  CHECK(child >= 0);
+  if (child == 0) {
+    ::close(start_pipe[1]);
+    ::close(ready_pipe[0]);
+    ::close(command_pipe[1]);
+    ::close(result_pipe[0]);
+    char start_signal = 0;
+    if (::read(start_pipe[0], &start_signal, 1) != 1) {
+      ::_exit(40);
+    }
+    auto consumer_result = SharedMemoryTransport::OpenConsumer(config);
+    if (!consumer_result.ok()) {
+      ::_exit(41);
+    }
+    auto consumer = std::move(consumer_result).take_value();
+    const char ready = 'R';
+    if (::write(ready_pipe[1], &ready, 1) != 1) {
+      ::_exit(42);
+    }
+    char command = 0;
+    if (::read(command_pipe[0], &command, 1) != 1) {
+      ::_exit(43);
+    }
+
+    std::array<std::byte, 64> destination{};
+    const auto stale_receive =
+        consumer->Receive(destination, Deadline::After(200ms));
+    const auto code =
+        static_cast<std::uint8_t>(stale_receive.status().code());
+    if (::write(result_pipe[1], &code, sizeof(code)) !=
+        static_cast<ssize_t>(sizeof(code))) {
+      ::_exit(44);
+    }
+    consumer->Close();
+    ::_exit(0);
+  }
+
+  ::close(start_pipe[0]);
+  ::close(ready_pipe[1]);
+  ::close(command_pipe[0]);
+  ::close(result_pipe[1]);
+  auto producer_result = SharedMemoryTransport::CreateProducer(config);
+  CHECK(producer_result.ok());
+  auto producer = std::move(producer_result).take_value();
+  const char start_signal = 'S';
+  CHECK(::write(start_pipe[1], &start_signal, 1) == 1);
+  ::close(start_pipe[1]);
+
+  char ready = 0;
+  CHECK(::read(ready_pipe[0], &ready, 1) == 1);
+  ::close(ready_pipe[0]);
+  CHECK(ready == 'R');
+
+  CHECK(::kill(child, SIGSTOP) == 0);
+  int stop_status = 0;
+  CHECK(::waitpid(child, &stop_status, WUNTRACED) == child);
+  CHECK(WIFSTOPPED(stop_status));
+  std::this_thread::sleep_for(300ms);
+
+  auto replacement_result = SharedMemoryTransport::OpenConsumer(config);
+  if (!replacement_result.ok()) {
+    static_cast<void>(::kill(child, SIGKILL));
+    static_cast<void>(::waitpid(child, nullptr, 0));
+  }
+  CHECK(replacement_result.ok());
+  auto replacement = std::move(replacement_result).take_value();
+  CHECK(replacement->generation() == producer->generation());
+
+  const std::array<std::byte, 1> payload{std::byte{0xB6}};
+  CHECK(producer
+            ->Send(payload, SendOptions{BackpressurePolicy::Block,
+                                        Deadline::After(200ms)})
+            .ok());
+  std::array<std::byte, 64> destination{};
+  const auto receive =
+      replacement->Receive(destination, Deadline::After(200ms));
+  CHECK(receive.ok());
+  CHECK(destination[0] == payload[0]);
+
+  CHECK(::kill(child, SIGCONT) == 0);
+  const char command = 'R';
+  CHECK(::write(command_pipe[1], &command, 1) == 1);
+  ::close(command_pipe[1]);
+  std::uint8_t stale_code = 0;
+  CHECK(::read(result_pipe[0], &stale_code, sizeof(stale_code)) ==
+        static_cast<ssize_t>(sizeof(stale_code)));
+  ::close(result_pipe[0]);
+
+  int child_status = 0;
+  CHECK(::waitpid(child, &child_status, 0) == child);
+  CHECK(WIFEXITED(child_status));
+  CHECK(WEXITSTATUS(child_status) == 0);
+  CHECK(stale_code ==
+        static_cast<std::uint8_t>(StatusCode::StaleGeneration));
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -554,5 +810,17 @@ int main() {
       result != 0) {
     return result;
   }
-  return GracefulCloseWakesInfinitePeerWait();
+  if (const int result = GracefulCloseWakesInfinitePeerWait();
+      result != 0) {
+    return result;
+  }
+  if (const int result = StoppedProducerExpiresAndOldGenerationIsFenced();
+      result != 0) {
+    return result;
+  }
+  if (const int result = IdleHeartbeatsPreventFalseTakeover();
+      result != 0) {
+    return result;
+  }
+  return StoppedConsumerExpiresAndOldRoleIsFenced();
 }

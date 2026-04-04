@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <ctime>
 #include <cstddef>
 #include <cstdint>
@@ -14,9 +16,12 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <utility>
 
 #include <fcntl.h>
@@ -42,6 +47,8 @@ enum class Role : std::uint8_t {
   Producer,
   Consumer,
 };
+
+std::atomic<std::uint64_t> g_role_token_counter{1};
 
 template <typename T>
 [[nodiscard]] T AtomicLoad(const T* address, int order) noexcept {
@@ -140,6 +147,26 @@ void FutexWake(std::uint32_t* epoch) noexcept {
       std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
 }
 
+[[nodiscard]] std::uint64_t GenerateRoleToken() noexcept {
+  const auto sequence =
+      g_role_token_counter.fetch_add(1U, std::memory_order_relaxed);
+  auto token = MonotonicNanoseconds() ^
+               (static_cast<std::uint64_t>(
+                    static_cast<std::uint32_t>(::getpid()))
+                << 32U) ^
+               sequence;
+  if (token == 0U) {
+    token = sequence | 1U;
+  }
+  return token;
+}
+
+[[nodiscard]] std::chrono::milliseconds HeartbeatInterval(
+    std::chrono::milliseconds peer_timeout) noexcept {
+  using namespace std::chrono_literals;
+  return std::clamp(peer_timeout / 4, 1ms, 250ms);
+}
+
 [[nodiscard]] std::uint64_t ProcessStartTicks(pid_t pid) {
   std::ifstream stream("/proc/" + std::to_string(pid) + "/stat");
   std::string line;
@@ -181,19 +208,57 @@ void FutexWake(std::uint32_t* epoch) noexcept {
   return ProcessStartTicks(static_cast<pid_t>(pid)) == expected_start_ticks;
 }
 
-[[nodiscard]] Status PeerStatus(const EndpointMetadata& metadata) {
+enum class EndpointLiveness : std::uint8_t {
+  Vacant,
+  Alive,
+  ProcessDead,
+  HeartbeatExpired,
+};
+
+[[nodiscard]] EndpointLiveness InspectEndpoint(
+    const EndpointMetadata& metadata,
+    std::chrono::milliseconds peer_timeout) {
   const auto pid = AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE);
   if (pid == 0) {
-    return Status(StatusCode::PeerUnavailable,
-                  "the peer role is not currently owned");
+    return EndpointLiveness::Vacant;
   }
   const auto start_ticks =
       AtomicLoad(&metadata.process_start_ticks, __ATOMIC_ACQUIRE);
   if (!ProcessIdentityAlive(pid, start_ticks)) {
-    return Status(StatusCode::PeerDead,
-                  "the peer process identity is no longer alive");
+    return EndpointLiveness::ProcessDead;
   }
-  return Status::Ok();
+
+  const auto heartbeat =
+      AtomicLoad(&metadata.heartbeat_monotonic_ns, __ATOMIC_ACQUIRE);
+  const auto now = MonotonicNanoseconds();
+  const auto timeout_count =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          peer_timeout).count();
+  const auto timeout_ns = static_cast<std::uint64_t>(timeout_count);
+  if (heartbeat == 0U ||
+      (now > heartbeat && now - heartbeat > timeout_ns)) {
+    return EndpointLiveness::HeartbeatExpired;
+  }
+  return EndpointLiveness::Alive;
+}
+
+[[nodiscard]] Status PeerStatus(
+    const EndpointMetadata& metadata,
+    std::chrono::milliseconds peer_timeout) {
+  switch (InspectEndpoint(metadata, peer_timeout)) {
+    case EndpointLiveness::Vacant:
+      return Status(StatusCode::PeerUnavailable,
+                    "the peer role is not currently owned");
+    case EndpointLiveness::ProcessDead:
+      return Status(StatusCode::PeerDead,
+                    "the peer process identity is no longer alive");
+    case EndpointLiveness::HeartbeatExpired:
+      return Status(StatusCode::PeerDead,
+                    "the peer heartbeat lease expired");
+    case EndpointLiveness::Alive:
+      return Status::Ok();
+  }
+  return Status(StatusCode::PeerDead, "unknown peer liveness state");
 }
 
 [[nodiscard]] Deadline ProbeDeadline(
@@ -300,9 +365,10 @@ struct Geometry {
   if (layout.header.magic != detail::kMagic) {
     return Status(StatusCode::LayoutMismatch, "shared-memory magic differs");
   }
-  if (layout.header.version_major != detail::kLayoutMajor) {
+  if (layout.header.version_major != detail::kLayoutMajor ||
+      layout.header.version_minor != detail::kLayoutMinor) {
     return Status(StatusCode::LayoutMismatch,
-                  "shared-memory major version is incompatible");
+                  "shared-memory layout version is incompatible");
   }
   if (layout.header.endian_marker != detail::kEndianMarker) {
     return Status(StatusCode::LayoutMismatch, "byte order is incompatible");
@@ -356,27 +422,82 @@ struct SharedMemoryTransport::Impl {
   bool owner{false};
   bool role_claimed{false};
   bool unlink_on_owner_close{false};
-  bool closed{false};
+  std::atomic<bool> closed{false};
   std::chrono::milliseconds peer_timeout{1000};
-  std::uint64_t observed_generation{0};
+  std::uint64_t process_start_ticks{0};
+  std::uint64_t role_token{0};
+  std::atomic<std::uint64_t> observed_generation{0};
+  std::mutex heartbeat_mutex;
+  std::condition_variable heartbeat_cv;
+  std::jthread heartbeat_thread;
 
   ~Impl() { Close(); }
 
+  [[nodiscard]] EndpointMetadata& RoleMetadata() noexcept {
+    return role == Role::Producer ? layout->producer : layout->consumer;
+  }
+
+  [[nodiscard]] bool OwnsRole() const noexcept {
+    if (layout == nullptr || !role_claimed) {
+      return false;
+    }
+    const auto& metadata =
+        role == Role::Producer ? layout->producer : layout->consumer;
+    return AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE) ==
+               static_cast<std::int32_t>(::getpid()) &&
+           AtomicLoad(&metadata.process_start_ticks, __ATOMIC_ACQUIRE) ==
+               process_start_ticks &&
+           AtomicLoad(&metadata.role_token, __ATOMIC_ACQUIRE) == role_token;
+  }
+
+  [[nodiscard]] Status StartHeartbeat() {
+    const auto interval = HeartbeatInterval(peer_timeout);
+    try {
+      heartbeat_thread = std::jthread(
+          [this, interval](std::stop_token stop_token) {
+            for (;;) {
+              if (stop_token.stop_requested() ||
+                  closed.load(std::memory_order_acquire) ||
+                  !OwnsRole()) {
+                return;
+              }
+              AtomicStore(&RoleMetadata().heartbeat_monotonic_ns,
+                          MonotonicNanoseconds(), __ATOMIC_RELEASE);
+
+              std::unique_lock lock(heartbeat_mutex);
+              heartbeat_cv.wait_for(lock, interval, [this, &stop_token] {
+                return stop_token.stop_requested() ||
+                       closed.load(std::memory_order_acquire);
+              });
+            }
+          });
+    } catch (const std::system_error& error) {
+      return Status(StatusCode::IoError,
+                    "failed to start endpoint heartbeat thread",
+                    error.code().value());
+    }
+    return Status::Ok();
+  }
+
   void Close() noexcept {
-    if (closed) {
+    if (closed.exchange(true, std::memory_order_acq_rel)) {
       return;
     }
-    closed = true;
 
+    heartbeat_thread.request_stop();
+    heartbeat_cv.notify_all();
+    if (heartbeat_thread.joinable()) {
+      heartbeat_thread.join();
+    }
+
+    bool may_unlink = owner && !role_claimed;
     if (layout != nullptr && role_claimed) {
-      auto& metadata =
-          role == Role::Producer ? layout->producer : layout->consumer;
-      const auto my_pid = static_cast<std::int32_t>(::getpid());
-      if (AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE) == my_pid &&
-          AtomicLoad(&metadata.process_start_ticks, __ATOMIC_ACQUIRE) ==
-              ProcessStartTicks(::getpid())) {
+      const bool owns_role = OwnsRole();
+      if (owns_role) {
+        auto& metadata = RoleMetadata();
         AtomicStore(&metadata.state, std::uint32_t{0}, __ATOMIC_RELAXED);
         AtomicStore(&metadata.pid, std::int32_t{0}, __ATOMIC_RELEASE);
+        may_unlink = owner;
       }
 
       auto* epoch = role == Role::Producer
@@ -395,7 +516,7 @@ struct SharedMemoryTransport::Impl {
       ::close(descriptor);
       descriptor = -1;
     }
-    if (owner && unlink_on_owner_close && !object_name.empty()) {
+    if (may_unlink && unlink_on_owner_close && !object_name.empty()) {
       ::shm_unlink(object_name.c_str());
     }
   }
@@ -474,12 +595,9 @@ SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
     }
 
     auto& metadata = impl->layout->producer;
-    const auto existing_pid =
-        AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE);
-    const auto existing_start_ticks =
-        AtomicLoad(&metadata.process_start_ticks, __ATOMIC_ACQUIRE);
-    if (existing_pid != 0 &&
-        ProcessIdentityAlive(existing_pid, existing_start_ticks)) {
+    const auto liveness =
+        InspectEndpoint(metadata, config.peer_timeout);
+    if (liveness == EndpointLiveness::Alive) {
       static_cast<void>(::flock(descriptor, LOCK_UN));
       return Status(StatusCode::RoleConflict,
                     "a live producer already owns this channel");
@@ -494,17 +612,26 @@ SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
     AtomicStore(&impl->layout->header.generation, next_generation,
                 __ATOMIC_RELEASE);
 
-    metadata.process_start_ticks = ProcessStartTicks(::getpid());
-    metadata.generation = next_generation;
-    metadata.heartbeat_monotonic_ns = MonotonicNanoseconds();
-    metadata.operation_sequence = 0U;
-    metadata.state = 1U;
+    const auto process_start_ticks = ProcessStartTicks(::getpid());
+    const auto role_token = GenerateRoleToken();
+    AtomicStore(&metadata.process_start_ticks, process_start_ticks,
+                __ATOMIC_RELAXED);
+    AtomicStore(&metadata.generation, next_generation, __ATOMIC_RELAXED);
+    AtomicStore(&metadata.role_token, role_token, __ATOMIC_RELAXED);
+    AtomicStore(&metadata.heartbeat_monotonic_ns, MonotonicNanoseconds(),
+                __ATOMIC_RELAXED);
+    AtomicStore(&metadata.operation_sequence, std::uint64_t{0},
+                __ATOMIC_RELAXED);
+    AtomicStore(&metadata.state, std::uint32_t{1}, __ATOMIC_RELAXED);
     AtomicStore(&metadata.pid, static_cast<std::int32_t>(::getpid()),
                 __ATOMIC_RELEASE);
 
+    impl->process_start_ticks = process_start_ticks;
+    impl->role_token = role_token;
     impl->role_claimed = true;
     impl->owner = true;
-    impl->observed_generation = next_generation;
+    impl->observed_generation.store(next_generation,
+                                    std::memory_order_relaxed);
     static_cast<void>(::flock(descriptor, LOCK_UN));
 
     AtomicFetchAdd(&impl->layout->producer_cursor.data_epoch,
@@ -513,6 +640,10 @@ SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
                    std::uint32_t{1}, __ATOMIC_RELEASE);
     FutexWake(&impl->layout->producer_cursor.data_epoch);
     FutexWake(&impl->layout->consumer_cursor.space_epoch);
+    const auto heartbeat_status = impl->StartHeartbeat();
+    if (!heartbeat_status) {
+      return heartbeat_status;
+    }
     return impl;
   }
 
@@ -568,16 +699,26 @@ SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
   layout.queue.slot_stride = geometry.slot_stride;
   layout.queue.slots_offset = geometry.slots_offset;
 
-  layout.producer.process_start_ticks = ProcessStartTicks(::getpid());
+  const auto process_start_ticks = ProcessStartTicks(::getpid());
+  const auto role_token = GenerateRoleToken();
+  layout.producer.process_start_ticks = process_start_ticks;
   layout.producer.generation = layout.header.generation;
+  layout.producer.role_token = role_token;
   layout.producer.heartbeat_monotonic_ns = MonotonicNanoseconds();
   layout.producer.state = 1U;
   AtomicStore(&layout.producer.pid, static_cast<std::int32_t>(::getpid()),
               __ATOMIC_RELEASE);
 
+  impl->process_start_ticks = process_start_ticks;
+  impl->role_token = role_token;
   impl->role_claimed = true;
-  impl->observed_generation = layout.header.generation;
+  impl->observed_generation.store(layout.header.generation,
+                                  std::memory_order_relaxed);
   AtomicStore(&layout.header.init_state, detail::kInitReady, __ATOMIC_RELEASE);
+  const auto heartbeat_status = impl->StartHeartbeat();
+  if (!heartbeat_status) {
+    return heartbeat_status;
+  }
   return impl;
 }
 
@@ -636,25 +777,37 @@ SharedMemoryTransport::OpenConsumerImpl(const ChannelConfig& config) {
                        "failed to lock shared-memory role metadata");
   }
   auto& metadata = impl->layout->consumer;
-  const auto existing_pid = AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE);
-  const auto existing_start_ticks =
-      AtomicLoad(&metadata.process_start_ticks, __ATOMIC_ACQUIRE);
-  if (existing_pid != 0 &&
-      ProcessIdentityAlive(existing_pid, existing_start_ticks)) {
+  const auto liveness =
+      InspectEndpoint(metadata, config.peer_timeout);
+  if (liveness == EndpointLiveness::Alive) {
     ::flock(descriptor, LOCK_UN);
     return Status(StatusCode::RoleConflict,
                   "a live consumer already owns this channel");
   }
-  metadata.process_start_ticks = ProcessStartTicks(::getpid());
-  metadata.generation = impl->layout->header.generation;
-  metadata.heartbeat_monotonic_ns = MonotonicNanoseconds();
-  metadata.state = 1U;
+
+  const auto process_start_ticks = ProcessStartTicks(::getpid());
+  const auto role_token = GenerateRoleToken();
+  AtomicStore(&metadata.process_start_ticks, process_start_ticks,
+              __ATOMIC_RELAXED);
+  AtomicStore(&metadata.generation, impl->layout->header.generation,
+              __ATOMIC_RELAXED);
+  AtomicStore(&metadata.role_token, role_token, __ATOMIC_RELAXED);
+  AtomicStore(&metadata.heartbeat_monotonic_ns, MonotonicNanoseconds(),
+              __ATOMIC_RELAXED);
+  AtomicStore(&metadata.state, std::uint32_t{1}, __ATOMIC_RELAXED);
   AtomicStore(&metadata.pid, static_cast<std::int32_t>(::getpid()),
               __ATOMIC_RELEASE);
+  impl->process_start_ticks = process_start_ticks;
+  impl->role_token = role_token;
   impl->role_claimed = true;
   ::flock(descriptor, LOCK_UN);
 
-  impl->observed_generation = impl->layout->header.generation;
+  impl->observed_generation.store(impl->layout->header.generation,
+                                  std::memory_order_relaxed);
+  const auto heartbeat_status = impl->StartHeartbeat();
+  if (!heartbeat_status) {
+    return heartbeat_status;
+  }
   return impl;
 }
 
@@ -685,18 +838,23 @@ SharedMemoryTransport::OpenConsumer(const ChannelConfig& config) {
 
 Status SharedMemoryTransport::Send(std::span<const std::byte> message,
                                    SendOptions options) {
-  if (!impl_ || impl_->closed) {
+  if (!impl_ || impl_->closed.load(std::memory_order_acquire)) {
     return Status(StatusCode::Closed);
   }
   if (impl_->role != Role::Producer) {
     return Status(StatusCode::RoleConflict,
                   "consumer endpoint cannot send");
   }
+  if (!impl_->OwnsRole()) {
+    return Status(StatusCode::StaleGeneration,
+                  "producer role was reclaimed by another endpoint");
+  }
 
   auto& layout = *impl_->layout;
   const auto current_generation =
       AtomicLoad(&layout.header.generation, __ATOMIC_ACQUIRE);
-  if (current_generation != impl_->observed_generation) {
+  if (current_generation !=
+      impl_->observed_generation.load(std::memory_order_acquire)) {
     return Status(StatusCode::StaleGeneration,
                   "producer was fenced by a newer channel generation");
   }
@@ -723,7 +881,7 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
                      std::uint64_t{1}, __ATOMIC_RELAXED);
       return Status(StatusCode::Timeout);
     }
-    const auto peer_status = PeerStatus(layout.consumer);
+    const auto peer_status = PeerStatus(layout.consumer, impl_->peer_timeout);
     if (!peer_status) {
       return peer_status;
     }
@@ -773,19 +931,25 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
 
 Result<std::size_t> SharedMemoryTransport::Receive(
     std::span<std::byte> destination, Deadline deadline) {
-  if (!impl_ || impl_->closed) {
+  if (!impl_ || impl_->closed.load(std::memory_order_acquire)) {
     return Status(StatusCode::Closed);
   }
   if (impl_->role != Role::Consumer) {
     return Status(StatusCode::RoleConflict,
                   "producer endpoint cannot receive");
   }
+  if (!impl_->OwnsRole()) {
+    return Status(StatusCode::StaleGeneration,
+                  "consumer role was reclaimed by another endpoint");
+  }
 
   auto& layout = *impl_->layout;
   const auto current_generation =
       AtomicLoad(&layout.header.generation, __ATOMIC_ACQUIRE);
-  if (current_generation != impl_->observed_generation) {
-    impl_->observed_generation = current_generation;
+  if (current_generation !=
+      impl_->observed_generation.load(std::memory_order_acquire)) {
+    impl_->observed_generation.store(current_generation,
+                                     std::memory_order_release);
     AtomicStore(&layout.consumer.generation, current_generation,
                 __ATOMIC_RELEASE);
   }
@@ -802,7 +966,7 @@ Result<std::size_t> SharedMemoryTransport::Receive(
                      std::uint64_t{1}, __ATOMIC_RELAXED);
       return Status(StatusCode::Timeout);
     }
-    const auto peer_status = PeerStatus(layout.producer);
+    const auto peer_status = PeerStatus(layout.producer, impl_->peer_timeout);
     if (!peer_status) {
       return peer_status;
     }
@@ -862,7 +1026,8 @@ Result<std::size_t> SharedMemoryTransport::Receive(
 
 TransportStats SharedMemoryTransport::Stats() const noexcept {
   TransportStats stats;
-  if (!impl_ || impl_->closed || impl_->layout == nullptr) {
+  if (!impl_ || impl_->closed.load(std::memory_order_acquire) ||
+      impl_->layout == nullptr) {
     return stats;
   }
   const auto& layout = *impl_->layout;
@@ -888,7 +1053,8 @@ void SharedMemoryTransport::Close() noexcept {
 }
 
 std::uint64_t SharedMemoryTransport::generation() const noexcept {
-  return impl_ ? impl_->observed_generation : 0U;
+  return impl_ ? impl_->observed_generation.load(std::memory_order_acquire)
+               : 0U;
 }
 
 }  // namespace fastipc
