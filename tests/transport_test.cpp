@@ -1,6 +1,8 @@
 #include <fastipc/shared_memory_transport.hpp>
 
 #include <array>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +13,8 @@
 #include <thread>
 #include <utility>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 namespace {
 
@@ -307,6 +311,214 @@ int DuplicateProducerCannotUnlinkLiveChannel() {
   return 0;
 }
 
+int KilledProducerIsDetectedAndReclaimed() {
+  using namespace std::chrono_literals;
+  using fastipc::BackpressurePolicy;
+  using fastipc::Deadline;
+  using fastipc::SendOptions;
+  using fastipc::SharedMemoryTransport;
+  using fastipc::StatusCode;
+
+  auto config = ConfigFor("fastipc_killed_producer");
+  config.unlink_on_owner_close = false;
+  config.peer_timeout = 80ms;
+
+  int ready_pipe[2]{-1, -1};
+  CHECK(::pipe(ready_pipe) == 0);
+  const pid_t child = ::fork();
+  CHECK(child >= 0);
+  if (child == 0) {
+    ::close(ready_pipe[0]);
+    auto producer_result = SharedMemoryTransport::CreateProducer(config);
+    if (!producer_result.ok()) {
+      ::_exit(10);
+    }
+    auto producer = std::move(producer_result).take_value();
+    const char ready = 'R';
+    if (::write(ready_pipe[1], &ready, 1) != 1) {
+      ::_exit(11);
+    }
+    for (;;) {
+      ::pause();
+    }
+  }
+
+  ::close(ready_pipe[1]);
+  char ready = 0;
+  ssize_t bytes_read = -1;
+  do {
+    bytes_read = ::read(ready_pipe[0], &ready, 1);
+  } while (bytes_read < 0 && errno == EINTR);
+  ::close(ready_pipe[0]);
+  CHECK(bytes_read == 1);
+  CHECK(ready == 'R');
+
+  auto consumer_result = SharedMemoryTransport::OpenConsumer(config);
+  CHECK(consumer_result.ok());
+  auto consumer = std::move(consumer_result).take_value();
+  const auto first_generation = consumer->generation();
+
+  CHECK(::kill(child, SIGKILL) == 0);
+  int child_status = 0;
+  CHECK(::waitpid(child, &child_status, 0) == child);
+  CHECK(WIFSIGNALED(child_status));
+
+  std::array<std::byte, 64> destination{};
+  const auto dead_receive =
+      consumer->Receive(destination, Deadline::After(2s));
+  CHECK(!dead_receive.ok());
+  CHECK(dead_receive.status().code() == StatusCode::PeerDead);
+
+  auto restart_config = config;
+  restart_config.unlink_on_owner_close = true;
+  auto restarted_result =
+      SharedMemoryTransport::CreateProducer(restart_config);
+  CHECK(restarted_result.ok());
+  auto producer = std::move(restarted_result).take_value();
+  CHECK(producer->generation() > first_generation);
+
+  const std::array<std::byte, 1> payload{std::byte{0xC7}};
+  CHECK(producer
+            ->Send(payload, SendOptions{BackpressurePolicy::Block,
+                                        Deadline::After(200ms)})
+            .ok());
+  const auto receive =
+      consumer->Receive(destination, Deadline::After(200ms));
+  CHECK(receive.ok());
+  CHECK(receive.value() == payload.size());
+  CHECK(destination[0] == payload[0]);
+  return 0;
+}
+
+int KilledConsumerIsDetectedAndReclaimed() {
+  using namespace std::chrono_literals;
+  using fastipc::BackpressurePolicy;
+  using fastipc::Deadline;
+  using fastipc::SendOptions;
+  using fastipc::SharedMemoryTransport;
+  using fastipc::StatusCode;
+
+  auto config = ConfigFor("fastipc_killed_consumer");
+  config.peer_timeout = 80ms;
+
+  int start_pipe[2]{-1, -1};
+  int ready_pipe[2]{-1, -1};
+  CHECK(::pipe(start_pipe) == 0);
+  CHECK(::pipe(ready_pipe) == 0);
+  const pid_t child = ::fork();
+  CHECK(child >= 0);
+  if (child == 0) {
+    ::close(start_pipe[1]);
+    ::close(ready_pipe[0]);
+    char start_signal = 0;
+    if (::read(start_pipe[0], &start_signal, 1) != 1) {
+      ::_exit(20);
+    }
+    auto consumer_result = SharedMemoryTransport::OpenConsumer(config);
+    if (!consumer_result.ok()) {
+      ::_exit(21);
+    }
+    auto consumer = std::move(consumer_result).take_value();
+    const char ready = 'R';
+    if (::write(ready_pipe[1], &ready, 1) != 1) {
+      ::_exit(22);
+    }
+    for (;;) {
+      ::pause();
+    }
+  }
+
+  ::close(start_pipe[0]);
+  ::close(ready_pipe[1]);
+  auto producer_result = SharedMemoryTransport::CreateProducer(config);
+  CHECK(producer_result.ok());
+  auto producer = std::move(producer_result).take_value();
+  const char start_signal = 'S';
+  CHECK(::write(start_pipe[1], &start_signal, 1) == 1);
+  ::close(start_pipe[1]);
+
+  char ready = 0;
+  CHECK(::read(ready_pipe[0], &ready, 1) == 1);
+  ::close(ready_pipe[0]);
+  CHECK(ready == 'R');
+
+  CHECK(::kill(child, SIGKILL) == 0);
+  int child_status = 0;
+  CHECK(::waitpid(child, &child_status, 0) == child);
+  CHECK(WIFSIGNALED(child_status));
+
+  for (std::uint8_t value = 0; value < config.slot_count; ++value) {
+    const std::array<std::byte, 1> payload{static_cast<std::byte>(value)};
+    CHECK(producer
+              ->Send(payload, SendOptions{BackpressurePolicy::Block,
+                                          Deadline::After(200ms)})
+              .ok());
+  }
+
+  const std::array<std::byte, 1> blocked_payload{std::byte{0xEE}};
+  const auto dead_send =
+      producer->Send(blocked_payload,
+                     SendOptions{BackpressurePolicy::Block,
+                                 Deadline::After(2s)});
+  CHECK(!dead_send.ok());
+  CHECK(dead_send.code() == StatusCode::PeerDead);
+
+  auto replacement_result = SharedMemoryTransport::OpenConsumer(config);
+  CHECK(replacement_result.ok());
+  auto replacement = std::move(replacement_result).take_value();
+  CHECK(replacement->generation() == producer->generation());
+
+  std::array<std::byte, 64> destination{};
+  for (std::uint8_t value = 0; value < config.slot_count; ++value) {
+    const auto received =
+        replacement->Receive(destination, Deadline::After(200ms));
+    CHECK(received.ok());
+    CHECK(received.value() == 1);
+    CHECK(destination[0] == static_cast<std::byte>(value));
+  }
+
+  CHECK(producer
+            ->Send(blocked_payload,
+                   SendOptions{BackpressurePolicy::Block,
+                               Deadline::After(200ms)})
+            .ok());
+  const auto restored =
+      replacement->Receive(destination, Deadline::After(200ms));
+  CHECK(restored.ok());
+  CHECK(destination[0] == blocked_payload[0]);
+  return 0;
+}
+
+int GracefulCloseWakesInfinitePeerWait() {
+  using namespace std::chrono_literals;
+  using fastipc::Deadline;
+  using fastipc::SharedMemoryTransport;
+  using fastipc::StatusCode;
+
+  const auto config = ConfigFor("fastipc_close_wake");
+  auto producer_result = SharedMemoryTransport::CreateProducer(config);
+  CHECK(producer_result.ok());
+  auto producer = std::move(producer_result).take_value();
+  auto consumer_result = SharedMemoryTransport::OpenConsumer(config);
+  CHECK(consumer_result.ok());
+  auto consumer = std::move(consumer_result).take_value();
+
+  std::atomic<int> observed_code{-1};
+  std::jthread waiting_consumer([&consumer, &observed_code] {
+    std::array<std::byte, 64> destination{};
+    const auto result = consumer->Receive(destination, Deadline::Infinite());
+    observed_code.store(static_cast<int>(result.status().code()),
+                        std::memory_order_relaxed);
+  });
+  std::this_thread::sleep_for(20ms);
+  producer->Close();
+  waiting_consumer.join();
+
+  CHECK(observed_code.load(std::memory_order_relaxed) ==
+        static_cast<int>(StatusCode::PeerUnavailable));
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -330,5 +542,17 @@ int main() {
       result != 0) {
     return result;
   }
-  return DuplicateProducerCannotUnlinkLiveChannel();
+  if (const int result = DuplicateProducerCannotUnlinkLiveChannel();
+      result != 0) {
+    return result;
+  }
+  if (const int result = KilledProducerIsDetectedAndReclaimed();
+      result != 0) {
+    return result;
+  }
+  if (const int result = KilledConsumerIsDetectedAndReclaimed();
+      result != 0) {
+    return result;
+  }
+  return GracefulCloseWakesInfinitePeerWait();
 }

@@ -21,6 +21,7 @@
 
 #include <fcntl.h>
 #include <linux/futex.h>
+#include <signal.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -30,6 +31,7 @@
 namespace fastipc {
 namespace {
 
+using detail::EndpointMetadata;
 using detail::SharedLayout;
 using detail::SlotHeader;
 
@@ -166,6 +168,44 @@ void FutexWake(std::uint32_t* epoch) noexcept {
   return 0;
 }
 
+[[nodiscard]] bool ProcessIdentityAlive(
+    std::int32_t pid, std::uint64_t expected_start_ticks) {
+  if (pid <= 0 || expected_start_ticks == 0U) {
+    return false;
+  }
+
+  errno = 0;
+  if (::kill(static_cast<pid_t>(pid), 0) != 0 && errno != EPERM) {
+    return false;
+  }
+  return ProcessStartTicks(static_cast<pid_t>(pid)) == expected_start_ticks;
+}
+
+[[nodiscard]] Status PeerStatus(const EndpointMetadata& metadata) {
+  const auto pid = AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE);
+  if (pid == 0) {
+    return Status(StatusCode::PeerUnavailable,
+                  "the peer role is not currently owned");
+  }
+  const auto start_ticks =
+      AtomicLoad(&metadata.process_start_ticks, __ATOMIC_ACQUIRE);
+  if (!ProcessIdentityAlive(pid, start_ticks)) {
+    return Status(StatusCode::PeerDead,
+                  "the peer process identity is no longer alive");
+  }
+  return Status::Ok();
+}
+
+[[nodiscard]] Deadline ProbeDeadline(
+    const Deadline& requested,
+    std::chrono::milliseconds peer_timeout) noexcept {
+  const auto probe_time = Deadline::Clock::now() + peer_timeout;
+  if (!requested.infinite() && requested.time_point() <= probe_time) {
+    return requested;
+  }
+  return Deadline::At(probe_time);
+}
+
 [[nodiscard]] Status ErrnoStatus(StatusCode fallback, std::string detail) {
   const int error = errno;
   StatusCode code = fallback;
@@ -196,6 +236,14 @@ void FutexWake(std::uint32_t* epoch) noexcept {
     }
   }
   return std::string("/") + std::string(name);
+}
+
+[[nodiscard]] Status ValidatePeerTimeout(const ChannelConfig& config) {
+  if (config.peer_timeout <= std::chrono::milliseconds::zero()) {
+    return Status(StatusCode::InvalidArgument,
+                  "peer_timeout must be positive");
+  }
+  return Status::Ok();
 }
 
 struct Geometry {
@@ -309,6 +357,7 @@ struct SharedMemoryTransport::Impl {
   bool role_claimed{false};
   bool unlink_on_owner_close{false};
   bool closed{false};
+  std::chrono::milliseconds peer_timeout{1000};
   std::uint64_t observed_generation{0};
 
   ~Impl() { Close(); }
@@ -324,10 +373,17 @@ struct SharedMemoryTransport::Impl {
           role == Role::Producer ? layout->producer : layout->consumer;
       const auto my_pid = static_cast<std::int32_t>(::getpid());
       if (AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE) == my_pid &&
-          metadata.process_start_ticks == ProcessStartTicks(::getpid())) {
+          AtomicLoad(&metadata.process_start_ticks, __ATOMIC_ACQUIRE) ==
+              ProcessStartTicks(::getpid())) {
         AtomicStore(&metadata.state, std::uint32_t{0}, __ATOMIC_RELAXED);
         AtomicStore(&metadata.pid, std::int32_t{0}, __ATOMIC_RELEASE);
       }
+
+      auto* epoch = role == Role::Producer
+                        ? &layout->producer_cursor.data_epoch
+                        : &layout->consumer_cursor.space_epoch;
+      AtomicFetchAdd(epoch, std::uint32_t{1}, __ATOMIC_RELEASE);
+      FutexWake(epoch);
     }
 
     if (mapping != MAP_FAILED) {
@@ -347,6 +403,10 @@ struct SharedMemoryTransport::Impl {
 
 [[nodiscard]] Result<std::unique_ptr<SharedMemoryTransport::Impl>>
 SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
+  const auto timeout_validation = ValidatePeerTimeout(config);
+  if (!timeout_validation) {
+    return timeout_validation;
+  }
   auto name_result = CanonicalName(config.name);
   if (!name_result) {
     return name_result.status();
@@ -401,6 +461,7 @@ SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
     impl->role = Role::Producer;
     impl->object_name = object_name;
     impl->unlink_on_owner_close = config.unlink_on_owner_close;
+    impl->peer_timeout = config.peer_timeout;
 
     const auto validation =
         ValidateLayout(*impl->layout, mapped_bytes, config);
@@ -413,10 +474,15 @@ SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
     }
 
     auto& metadata = impl->layout->producer;
-    if (AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE) != 0) {
+    const auto existing_pid =
+        AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE);
+    const auto existing_start_ticks =
+        AtomicLoad(&metadata.process_start_ticks, __ATOMIC_ACQUIRE);
+    if (existing_pid != 0 &&
+        ProcessIdentityAlive(existing_pid, existing_start_ticks)) {
       static_cast<void>(::flock(descriptor, LOCK_UN));
       return Status(StatusCode::RoleConflict,
-                    "a producer already owns this channel");
+                    "a live producer already owns this channel");
     }
 
     const auto previous_generation =
@@ -477,6 +543,7 @@ SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
   impl->object_name = object_name;
   impl->owner = true;
   impl->unlink_on_owner_close = config.unlink_on_owner_close;
+  impl->peer_timeout = config.peer_timeout;
 
   std::memset(mapping, 0, geometry.segment_bytes);
   auto& layout = *impl->layout;
@@ -516,6 +583,10 @@ SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
 
 [[nodiscard]] Result<std::unique_ptr<SharedMemoryTransport::Impl>>
 SharedMemoryTransport::OpenConsumerImpl(const ChannelConfig& config) {
+  const auto timeout_validation = ValidatePeerTimeout(config);
+  if (!timeout_validation) {
+    return timeout_validation;
+  }
   auto name_result = CanonicalName(config.name);
   if (!name_result) {
     return name_result.status();
@@ -553,6 +624,7 @@ SharedMemoryTransport::OpenConsumerImpl(const ChannelConfig& config) {
   impl->layout = static_cast<SharedLayout*>(mapping);
   impl->role = Role::Consumer;
   impl->object_name = object_name;
+  impl->peer_timeout = config.peer_timeout;
 
   const auto validation = ValidateLayout(*impl->layout, mapped_bytes, config);
   if (!validation) {
@@ -565,10 +637,13 @@ SharedMemoryTransport::OpenConsumerImpl(const ChannelConfig& config) {
   }
   auto& metadata = impl->layout->consumer;
   const auto existing_pid = AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE);
-  if (existing_pid != 0) {
+  const auto existing_start_ticks =
+      AtomicLoad(&metadata.process_start_ticks, __ATOMIC_ACQUIRE);
+  if (existing_pid != 0 &&
+      ProcessIdentityAlive(existing_pid, existing_start_ticks)) {
     ::flock(descriptor, LOCK_UN);
     return Status(StatusCode::RoleConflict,
-                  "a consumer already owns this channel");
+                  "a live consumer already owns this channel");
   }
   metadata.process_start_ticks = ProcessStartTicks(::getpid());
   metadata.generation = impl->layout->header.generation;
@@ -622,9 +697,8 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
   const auto current_generation =
       AtomicLoad(&layout.header.generation, __ATOMIC_ACQUIRE);
   if (current_generation != impl_->observed_generation) {
-    impl_->observed_generation = current_generation;
-    AtomicStore(&layout.producer.generation, current_generation,
-                __ATOMIC_RELEASE);
+    return Status(StatusCode::StaleGeneration,
+                  "producer was fenced by a newer channel generation");
   }
   if (message.size() > layout.queue.max_message_size) {
     return Status(StatusCode::MessageTooLarge);
@@ -649,6 +723,10 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
                      std::uint64_t{1}, __ATOMIC_RELAXED);
       return Status(StatusCode::Timeout);
     }
+    const auto peer_status = PeerStatus(layout.consumer);
+    if (!peer_status) {
+      return peer_status;
+    }
 
     const auto expected_epoch =
         AtomicLoad(&layout.consumer_cursor.space_epoch, __ATOMIC_ACQUIRE);
@@ -662,11 +740,9 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
 
     const auto wait =
         FutexWait(&layout.consumer_cursor.space_epoch, expected_epoch,
-                  options.deadline);
+                  ProbeDeadline(options.deadline, impl_->peer_timeout));
     if (wait.result == FutexWaitResult::TimedOut) {
-      AtomicFetchAdd(&layout.producer_cursor.timeout_count,
-                     std::uint64_t{1}, __ATOMIC_RELAXED);
-      return Status(StatusCode::Timeout);
+      continue;
     }
     if (wait.result == FutexWaitResult::Error) {
       return Status(StatusCode::IoError, "futex wait for queue space failed",
@@ -726,6 +802,10 @@ Result<std::size_t> SharedMemoryTransport::Receive(
                      std::uint64_t{1}, __ATOMIC_RELAXED);
       return Status(StatusCode::Timeout);
     }
+    const auto peer_status = PeerStatus(layout.producer);
+    if (!peer_status) {
+      return peer_status;
+    }
 
     const auto expected_epoch =
         AtomicLoad(&layout.producer_cursor.data_epoch, __ATOMIC_ACQUIRE);
@@ -738,11 +818,10 @@ Result<std::size_t> SharedMemoryTransport::Receive(
     }
 
     const auto wait =
-        FutexWait(&layout.producer_cursor.data_epoch, expected_epoch, deadline);
+        FutexWait(&layout.producer_cursor.data_epoch, expected_epoch,
+                  ProbeDeadline(deadline, impl_->peer_timeout));
     if (wait.result == FutexWaitResult::TimedOut) {
-      AtomicFetchAdd(&layout.consumer_cursor.timeout_count,
-                     std::uint64_t{1}, __ATOMIC_RELAXED);
-      return Status(StatusCode::Timeout);
+      continue;
     }
     if (wait.result == FutexWaitResult::Error) {
       return Status(StatusCode::IoError, "futex wait for queue data failed",

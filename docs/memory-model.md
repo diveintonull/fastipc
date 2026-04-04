@@ -34,6 +34,7 @@ by both peers.
 | header.init_state | release | acquire | Static layout fields are visible before validation. |
 | header.generation | release store | acquire load | A replacement producer publishes a new session identity before endpoint ownership and messages. |
 | endpoint.pid | release | acquire | PID publication follows endpoint metadata initialization. |
+| endpoint.process_start_ticks | initialized before PID release | read after PID acquire | PID plus Linux start ticks distinguishes the original process from a recycled PID. |
 | producer_cursor.head | relaxed load, release store | acquire load | Release publishes slot length, sequence, and payload; acquire makes them visible. Only the producer writes head. |
 | consumer_cursor.tail | relaxed load, release store | acquire load | Release publishes completion of the slot read; producer acquire prevents early reuse. Only the consumer writes tail. |
 | data_epoch | release fetch-add | acquire load | Orders the state transition before wakeup and provides a stable futex expected value. |
@@ -84,6 +85,22 @@ Deadline stores one steady-clock target. Before each kernel wait, FastIPC
 converts remaining duration to one CLOCK_MONOTONIC absolute timespec and uses
 FUTEX_WAIT_BITSET. EINTR, EAGAIN, and spurious wakes cannot extend the deadline
 because each conversion derives from the original target.
+
+## Peer death and bounded probes
+
+A blocked operation has two absolute deadlines: the caller's deadline and the
+next liveness probe. FastIPC waits until the earlier one. A liveness-probe
+timeout returns to the queue predicate instead of being reported as a caller
+timeout. The next loop checks the peer's released PID plus Linux process-start
+ticks; a missing PID is PeerUnavailable, while a vanished or recycled process
+identity is PeerDead.
+
+SIGKILL cannot increment an epoch, so this bounded probe is what prevents an
+infinite futex sleep after a crash. Graceful Close clears PID with release
+ordering, increments the epoch observed by the peer, and wakes it immediately.
+Dead-role takeover remains outside the SPSC hot path and is serialized by the
+shared-memory descriptor's flock. Producer takeover increments the channel
+generation before publishing the new PID, fencing older producers.
 
 ## Buffer and corruption semantics
 
