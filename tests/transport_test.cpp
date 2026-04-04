@@ -236,6 +236,77 @@ int EpochProtocolDoesNotLoseWakeups() {
   return 0;
 }
 
+int ProducerRestartAdvancesGenerationAndRestoresFlow() {
+  using namespace std::chrono_literals;
+  using fastipc::BackpressurePolicy;
+  using fastipc::Deadline;
+  using fastipc::SendOptions;
+  using fastipc::SharedMemoryTransport;
+
+  auto config = ConfigFor("fastipc_producer_restart");
+  config.unlink_on_owner_close = false;
+
+  auto first_result = SharedMemoryTransport::CreateProducer(config);
+  CHECK(first_result.ok());
+  auto first_producer = std::move(first_result).take_value();
+  auto consumer_result = SharedMemoryTransport::OpenConsumer(config);
+  CHECK(consumer_result.ok());
+  auto consumer = std::move(consumer_result).take_value();
+
+  const auto first_generation = first_producer->generation();
+  CHECK(first_generation != 0);
+  first_producer->Close();
+
+  auto restart_config = config;
+  restart_config.unlink_on_owner_close = true;
+  auto restarted_result =
+      SharedMemoryTransport::CreateProducer(restart_config);
+  CHECK(restarted_result.ok());
+  auto restarted_producer = std::move(restarted_result).take_value();
+  CHECK(restarted_producer->generation() > first_generation);
+
+  const std::array<std::byte, 2> payload{
+      std::byte{0x55}, std::byte{0xAA}};
+  CHECK(restarted_producer
+            ->Send(payload, SendOptions{BackpressurePolicy::Block,
+                                        Deadline::After(200ms)})
+            .ok());
+
+  std::array<std::byte, 64> destination{};
+  const auto receive =
+      consumer->Receive(destination, Deadline::After(200ms));
+  CHECK(receive.ok());
+  CHECK(receive.value() == payload.size());
+  CHECK(destination[0] == payload[0]);
+  CHECK(destination[1] == payload[1]);
+  CHECK(consumer->generation() == restarted_producer->generation());
+  return 0;
+}
+
+int DuplicateProducerCannotUnlinkLiveChannel() {
+  using fastipc::SharedMemoryTransport;
+  using fastipc::StatusCode;
+
+  auto config = ConfigFor("fastipc_duplicate_producer");
+  auto producer_result = SharedMemoryTransport::CreateProducer(config);
+  CHECK(producer_result.ok());
+  auto producer = std::move(producer_result).take_value();
+
+  auto conflicting_config = config;
+  conflicting_config.unlink_on_owner_close = true;
+  const auto conflict =
+      SharedMemoryTransport::CreateProducer(conflicting_config);
+  CHECK(!conflict.ok());
+  CHECK(conflict.status().code() == StatusCode::RoleConflict);
+
+  auto consumer_result = SharedMemoryTransport::OpenConsumer(config);
+  CHECK(consumer_result.ok());
+  auto consumer = std::move(consumer_result).take_value();
+  producer->Close();
+  consumer->Close();
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -252,5 +323,12 @@ int main() {
   if (const int result = EmptyReceiveHonorsAbsoluteDeadline(); result != 0) {
     return result;
   }
-  return EpochProtocolDoesNotLoseWakeups();
+  if (const int result = EpochProtocolDoesNotLoseWakeups(); result != 0) {
+    return result;
+  }
+  if (const int result = ProducerRestartAdvancesGenerationAndRestoresFlow();
+      result != 0) {
+    return result;
+  }
+  return DuplicateProducerCannotUnlinkLiveChannel();
 }

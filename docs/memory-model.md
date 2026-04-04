@@ -32,6 +32,7 @@ by both peers.
 | Field / operation | Writer order | Reader order | Reason |
 | --- | --- | --- | --- |
 | header.init_state | release | acquire | Static layout fields are visible before validation. |
+| header.generation | release store | acquire load | A replacement producer publishes a new session identity before endpoint ownership and messages. |
 | endpoint.pid | release | acquire | PID publication follows endpoint metadata initialization. |
 | producer_cursor.head | relaxed load, release store | acquire load | Release publishes slot length, sequence, and payload; acquire makes them visible. Only the producer writes head. |
 | consumer_cursor.tail | relaxed load, release store | acquire load | Release publishes completion of the slot read; producer acquire prevents early reuse. Only the consumer writes tail. |

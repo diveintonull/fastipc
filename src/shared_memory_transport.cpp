@@ -306,6 +306,7 @@ struct SharedMemoryTransport::Impl {
   Role role{Role::Producer};
   std::string object_name;
   bool owner{false};
+  bool role_claimed{false};
   bool unlink_on_owner_close{false};
   bool closed{false};
   std::uint64_t observed_generation{0};
@@ -318,7 +319,7 @@ struct SharedMemoryTransport::Impl {
     }
     closed = true;
 
-    if (layout != nullptr) {
+    if (layout != nullptr && role_claimed) {
       auto& metadata =
           role == Role::Producer ? layout->producer : layout->consumer;
       const auto my_pid = static_cast<std::int32_t>(::getpid());
@@ -357,13 +358,98 @@ SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
   const auto geometry = geometry_result.value();
   const std::string object_name = std::move(name_result).take_value();
 
-  const int descriptor =
+  bool created = true;
+  int descriptor =
       ::shm_open(object_name.c_str(), O_CREAT | O_EXCL | O_RDWR,
                  static_cast<mode_t>(config.permissions));
+  if (descriptor < 0 && errno == EEXIST) {
+    created = false;
+    descriptor = ::shm_open(object_name.c_str(), O_RDWR, 0);
+  }
   if (descriptor < 0) {
     return ErrnoStatus(StatusCode::IoError,
-                       "failed to create shared-memory object");
+                       "failed to create or open shared-memory object");
   }
+
+  if (!created) {
+    struct stat object_stat {};
+    if (::fstat(descriptor, &object_stat) != 0 ||
+        object_stat.st_size < static_cast<off_t>(sizeof(SharedLayout))) {
+      const auto status =
+          ErrnoStatus(StatusCode::LayoutMismatch,
+                      "existing shared-memory object is smaller than header");
+      ::close(descriptor);
+      return status;
+    }
+
+    const auto mapped_bytes = static_cast<std::size_t>(object_stat.st_size);
+    void* mapping = ::mmap(nullptr, mapped_bytes, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, descriptor, 0);
+    if (mapping == MAP_FAILED) {
+      const auto status =
+          ErrnoStatus(StatusCode::IoError,
+                      "failed to map existing shared-memory object");
+      ::close(descriptor);
+      return status;
+    }
+
+    auto impl = std::make_unique<SharedMemoryTransport::Impl>();
+    impl->descriptor = descriptor;
+    impl->mapping = mapping;
+    impl->mapped_bytes = mapped_bytes;
+    impl->layout = static_cast<SharedLayout*>(mapping);
+    impl->role = Role::Producer;
+    impl->object_name = object_name;
+    impl->unlink_on_owner_close = config.unlink_on_owner_close;
+
+    const auto validation =
+        ValidateLayout(*impl->layout, mapped_bytes, config);
+    if (!validation) {
+      return validation;
+    }
+    if (::flock(descriptor, LOCK_EX) != 0) {
+      return ErrnoStatus(StatusCode::IoError,
+                         "failed to lock producer role metadata");
+    }
+
+    auto& metadata = impl->layout->producer;
+    if (AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE) != 0) {
+      static_cast<void>(::flock(descriptor, LOCK_UN));
+      return Status(StatusCode::RoleConflict,
+                    "a producer already owns this channel");
+    }
+
+    const auto previous_generation =
+        AtomicLoad(&impl->layout->header.generation, __ATOMIC_ACQUIRE);
+    std::uint64_t next_generation = previous_generation + 1U;
+    if (next_generation == 0U) {
+      next_generation = 1U;
+    }
+    AtomicStore(&impl->layout->header.generation, next_generation,
+                __ATOMIC_RELEASE);
+
+    metadata.process_start_ticks = ProcessStartTicks(::getpid());
+    metadata.generation = next_generation;
+    metadata.heartbeat_monotonic_ns = MonotonicNanoseconds();
+    metadata.operation_sequence = 0U;
+    metadata.state = 1U;
+    AtomicStore(&metadata.pid, static_cast<std::int32_t>(::getpid()),
+                __ATOMIC_RELEASE);
+
+    impl->role_claimed = true;
+    impl->owner = true;
+    impl->observed_generation = next_generation;
+    static_cast<void>(::flock(descriptor, LOCK_UN));
+
+    AtomicFetchAdd(&impl->layout->producer_cursor.data_epoch,
+                   std::uint32_t{1}, __ATOMIC_RELEASE);
+    AtomicFetchAdd(&impl->layout->consumer_cursor.space_epoch,
+                   std::uint32_t{1}, __ATOMIC_RELEASE);
+    FutexWake(&impl->layout->producer_cursor.data_epoch);
+    FutexWake(&impl->layout->consumer_cursor.space_epoch);
+    return impl;
+  }
+
   if (::ftruncate(descriptor, static_cast<off_t>(geometry.segment_bytes)) != 0) {
     const auto status =
         ErrnoStatus(StatusCode::IoError, "failed to size shared-memory object");
@@ -422,6 +508,7 @@ SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
   AtomicStore(&layout.producer.pid, static_cast<std::int32_t>(::getpid()),
               __ATOMIC_RELEASE);
 
+  impl->role_claimed = true;
   impl->observed_generation = layout.header.generation;
   AtomicStore(&layout.header.init_state, detail::kInitReady, __ATOMIC_RELEASE);
   return impl;
@@ -489,6 +576,7 @@ SharedMemoryTransport::OpenConsumerImpl(const ChannelConfig& config) {
   metadata.state = 1U;
   AtomicStore(&metadata.pid, static_cast<std::int32_t>(::getpid()),
               __ATOMIC_RELEASE);
+  impl->role_claimed = true;
   ::flock(descriptor, LOCK_UN);
 
   impl->observed_generation = impl->layout->header.generation;
@@ -531,6 +619,13 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
   }
 
   auto& layout = *impl_->layout;
+  const auto current_generation =
+      AtomicLoad(&layout.header.generation, __ATOMIC_ACQUIRE);
+  if (current_generation != impl_->observed_generation) {
+    impl_->observed_generation = current_generation;
+    AtomicStore(&layout.producer.generation, current_generation,
+                __ATOMIC_RELEASE);
+  }
   if (message.size() > layout.queue.max_message_size) {
     return Status(StatusCode::MessageTooLarge);
   }
@@ -611,6 +706,13 @@ Result<std::size_t> SharedMemoryTransport::Receive(
   }
 
   auto& layout = *impl_->layout;
+  const auto current_generation =
+      AtomicLoad(&layout.header.generation, __ATOMIC_ACQUIRE);
+  if (current_generation != impl_->observed_generation) {
+    impl_->observed_generation = current_generation;
+    AtomicStore(&layout.consumer.generation, current_generation,
+                __ATOMIC_RELEASE);
+  }
   std::uint64_t tail = 0;
   for (;;) {
     tail = AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_RELAXED);
