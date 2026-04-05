@@ -57,4 +57,27 @@ if(BUILD_TESTING AND FASTIPC_BUILD_TESTS)
                 -Wsign-conversion)
     endif()
     add_test(NAME fastipc.transport COMMAND fastipc_tests)
+
+    set(
+        FASTIPC_FAULT_CASES
+        peer_missing
+        producer_crash
+        consumer_crash
+        restart
+        slow_consumer
+        timeout
+        malformed_header
+        version_mismatch
+        stale_shared_memory
+        queue_full
+        queue_empty
+        rapid_restart)
+    foreach(fault_case IN LISTS FASTIPC_FAULT_CASES)
+        add_test(
+            NAME fastipc.fault.${fault_case}
+            COMMAND fastipc_tests --case ${fault_case})
+        set_tests_properties(
+            fastipc.fault.${fault_case}
+            PROPERTIES LABELS fault)
+    endforeach()
 endif()

@@ -735,8 +735,13 @@ SharedMemoryTransport::OpenConsumerImpl(const ChannelConfig& config) {
   const std::string object_name = std::move(name_result).take_value();
   const int descriptor = ::shm_open(object_name.c_str(), O_RDWR, 0);
   if (descriptor < 0) {
+    const int error = errno;
+    if (error == ENOENT) {
+      return Status(StatusCode::PeerUnavailable,
+                    "producer shared-memory object is unavailable", error);
+    }
     return ErrnoStatus(StatusCode::PeerUnavailable,
-                       "producer shared-memory object is unavailable");
+                       "failed to open producer shared-memory object");
   }
 
   struct stat object_stat {};

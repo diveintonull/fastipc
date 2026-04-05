@@ -10,9 +10,13 @@
 #include <iostream>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
+#include <fcntl.h>
 #include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -40,6 +44,42 @@ fastipc::ChannelConfig ConfigFor(const std::string& test_name) {
   config.max_message_size = 64;
   config.unlink_on_owner_close = true;
   return config;
+}
+
+bool MutateSharedMemory(const fastipc::ChannelConfig& config,
+                        std::size_t offset,
+                        std::span<const std::byte> replacement) {
+  const std::string object_name = "/" + config.name;
+  const int descriptor = ::shm_open(object_name.c_str(), O_RDWR, 0);
+  if (descriptor < 0) {
+    return false;
+  }
+  struct stat object_stat {};
+  if (::fstat(descriptor, &object_stat) != 0 ||
+      object_stat.st_size <= 0 ||
+      offset + replacement.size() >
+          static_cast<std::size_t>(object_stat.st_size)) {
+    ::close(descriptor);
+    return false;
+  }
+
+  const auto mapped_bytes = static_cast<std::size_t>(object_stat.st_size);
+  void* mapping = ::mmap(nullptr, mapped_bytes, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, descriptor, 0);
+  if (mapping == MAP_FAILED) {
+    ::close(descriptor);
+    return false;
+  }
+  auto* bytes = static_cast<std::byte*>(mapping);
+  std::memcpy(bytes + offset, replacement.data(), replacement.size());
+  ::munmap(mapping, mapped_bytes);
+  ::close(descriptor);
+  return true;
+}
+
+void UnlinkSharedMemory(const fastipc::ChannelConfig& config) {
+  const std::string object_name = "/" + config.name;
+  static_cast<void>(::shm_unlink(object_name.c_str()));
 }
 
 int SharedMemoryTransportsExchangeOneMessage() {
@@ -775,52 +815,228 @@ int StoppedConsumerExpiresAndOldRoleIsFenced() {
   return 0;
 }
 
+
+int PeerMissingHasTypedStatus() {
+  using fastipc::SharedMemoryTransport;
+  using fastipc::StatusCode;
+
+  const auto config = ConfigFor("fastipc_peer_missing");
+  const auto result = SharedMemoryTransport::OpenConsumer(config);
+  CHECK(!result.ok());
+  CHECK(result.status().code() == StatusCode::PeerUnavailable);
+  return 0;
+}
+
+int FullQueueAppliesDropAndTimeoutPolicies() {
+  using namespace std::chrono_literals;
+  using fastipc::BackpressurePolicy;
+  using fastipc::Deadline;
+  using fastipc::SendOptions;
+  using fastipc::SharedMemoryTransport;
+  using fastipc::StatusCode;
+
+  auto config = ConfigFor("fastipc_queue_full");
+  config.slot_count = 2;
+  auto producer_result = SharedMemoryTransport::CreateProducer(config);
+  CHECK(producer_result.ok());
+  auto producer = std::move(producer_result).take_value();
+  auto consumer_result = SharedMemoryTransport::OpenConsumer(config);
+  CHECK(consumer_result.ok());
+  auto consumer = std::move(consumer_result).take_value();
+
+  const std::array<std::byte, 1> payload{std::byte{0x71}};
+  CHECK(producer
+            ->Send(payload, SendOptions{BackpressurePolicy::Block,
+                                        Deadline::After(100ms)})
+            .ok());
+  CHECK(producer
+            ->Send(payload, SendOptions{BackpressurePolicy::Block,
+                                        Deadline::After(100ms)})
+            .ok());
+
+  const auto dropped =
+      producer->Send(payload,
+                     SendOptions{BackpressurePolicy::Drop,
+                                 Deadline::Infinite()});
+  CHECK(dropped.code() == StatusCode::Dropped);
+  const auto timed_out =
+      producer->Send(payload,
+                     SendOptions{BackpressurePolicy::Timeout,
+                                 Deadline::After(30ms)});
+  CHECK(timed_out.code() == StatusCode::Timeout);
+
+  const auto stats = producer->Stats();
+  CHECK(stats.dropped_messages == 1);
+  CHECK(stats.send_timeouts == 1);
+  return 0;
+}
+
+int MalformedHeaderIsRejected() {
+  using fastipc::SharedMemoryTransport;
+  using fastipc::StatusCode;
+
+  auto config = ConfigFor("fastipc_malformed_header");
+  config.unlink_on_owner_close = false;
+  auto producer_result = SharedMemoryTransport::CreateProducer(config);
+  CHECK(producer_result.ok());
+  auto producer = std::move(producer_result).take_value();
+  producer->Close();
+
+  const std::array<std::byte, 1> replacement{std::byte{'X'}};
+  const bool mutated = MutateSharedMemory(config, 0, replacement);
+  const auto consumer_result = SharedMemoryTransport::OpenConsumer(config);
+  UnlinkSharedMemory(config);
+
+  CHECK(mutated);
+  CHECK(!consumer_result.ok());
+  CHECK(consumer_result.status().code() == StatusCode::LayoutMismatch);
+  return 0;
+}
+
+int VersionMismatchIsRejected() {
+  using fastipc::SharedMemoryTransport;
+  using fastipc::StatusCode;
+
+  auto config = ConfigFor("fastipc_version_mismatch");
+  config.unlink_on_owner_close = false;
+  auto producer_result = SharedMemoryTransport::CreateProducer(config);
+  CHECK(producer_result.ok());
+  auto producer = std::move(producer_result).take_value();
+  producer->Close();
+
+  constexpr std::size_t version_major_offset = 8;
+  const std::uint16_t unsupported_version = 0xFFFFU;
+  const auto* version_bytes =
+      reinterpret_cast<const std::byte*>(&unsupported_version);
+  const bool mutated =
+      MutateSharedMemory(config, version_major_offset,
+                         std::span<const std::byte>(
+                             version_bytes, sizeof(unsupported_version)));
+  const auto consumer_result = SharedMemoryTransport::OpenConsumer(config);
+  UnlinkSharedMemory(config);
+
+  CHECK(mutated);
+  CHECK(!consumer_result.ok());
+  CHECK(consumer_result.status().code() == StatusCode::LayoutMismatch);
+  return 0;
+}
+
+int RapidProducerRestartPreservesFlow() {
+  using namespace std::chrono_literals;
+  using fastipc::BackpressurePolicy;
+  using fastipc::Deadline;
+  using fastipc::SendOptions;
+  using fastipc::SharedMemoryTransport;
+
+  auto config = ConfigFor("fastipc_rapid_restart");
+  config.unlink_on_owner_close = false;
+  auto producer_result = SharedMemoryTransport::CreateProducer(config);
+  CHECK(producer_result.ok());
+  auto producer = std::move(producer_result).take_value();
+  auto consumer_result = SharedMemoryTransport::OpenConsumer(config);
+  CHECK(consumer_result.ok());
+  auto consumer = std::move(consumer_result).take_value();
+
+  auto previous_generation = producer->generation();
+  constexpr std::uint8_t restart_count = 16;
+  std::array<std::byte, 64> destination{};
+  for (std::uint8_t iteration = 0; iteration < restart_count; ++iteration) {
+    producer->Close();
+    auto restart_config = config;
+    restart_config.unlink_on_owner_close =
+        iteration + 1U == restart_count;
+    auto restart_result =
+        SharedMemoryTransport::CreateProducer(restart_config);
+    CHECK(restart_result.ok());
+    producer = std::move(restart_result).take_value();
+    CHECK(producer->generation() > previous_generation);
+    previous_generation = producer->generation();
+
+    const std::array<std::byte, 1> payload{
+        static_cast<std::byte>(iteration)};
+    CHECK(producer
+              ->Send(payload, SendOptions{BackpressurePolicy::Block,
+                                          Deadline::After(200ms)})
+              .ok());
+    const auto received =
+        consumer->Receive(destination, Deadline::After(200ms));
+    CHECK(received.ok());
+    CHECK(received.value() == payload.size());
+    CHECK(destination[0] == payload[0]);
+  }
+  return 0;
+}
+
+int DuplicateConsumerIsRejected() {
+  using fastipc::SharedMemoryTransport;
+  using fastipc::StatusCode;
+
+  const auto config = ConfigFor("fastipc_duplicate_consumer");
+  auto producer_result = SharedMemoryTransport::CreateProducer(config);
+  CHECK(producer_result.ok());
+  auto producer = std::move(producer_result).take_value();
+  auto first_result = SharedMemoryTransport::OpenConsumer(config);
+  CHECK(first_result.ok());
+  auto first = std::move(first_result).take_value();
+
+  const auto duplicate = SharedMemoryTransport::OpenConsumer(config);
+  CHECK(!duplicate.ok());
+  CHECK(duplicate.status().code() == StatusCode::RoleConflict);
+  return 0;
+}
+
+struct NamedTest {
+  std::string_view name;
+  int (*run)();
+};
+
+constexpr std::array kTests{
+    NamedTest{"exchange", SharedMemoryTransportsExchangeOneMessage},
+    NamedTest{"queue_empty", ConsumerSleepsUntilProducerPublishes},
+    NamedTest{"slow_consumer", ProducerSleepsUntilConsumerFreesSlot},
+    NamedTest{"timeout", EmptyReceiveHonorsAbsoluteDeadline},
+    NamedTest{"epoch_stress", EpochProtocolDoesNotLoseWakeups},
+    NamedTest{"restart", ProducerRestartAdvancesGenerationAndRestoresFlow},
+    NamedTest{"duplicate_producer", DuplicateProducerCannotUnlinkLiveChannel},
+    NamedTest{"producer_crash", KilledProducerIsDetectedAndReclaimed},
+    NamedTest{"consumer_crash", KilledConsumerIsDetectedAndReclaimed},
+    NamedTest{"graceful_close", GracefulCloseWakesInfinitePeerWait},
+    NamedTest{"stale_shared_memory",
+              StoppedProducerExpiresAndOldGenerationIsFenced},
+    NamedTest{"idle_heartbeat", IdleHeartbeatsPreventFalseTakeover},
+    NamedTest{"stale_consumer", StoppedConsumerExpiresAndOldRoleIsFenced},
+    NamedTest{"peer_missing", PeerMissingHasTypedStatus},
+    NamedTest{"queue_full", FullQueueAppliesDropAndTimeoutPolicies},
+    NamedTest{"malformed_header", MalformedHeaderIsRejected},
+    NamedTest{"version_mismatch", VersionMismatchIsRejected},
+    NamedTest{"rapid_restart", RapidProducerRestartPreservesFlow},
+    NamedTest{"duplicate_consumer", DuplicateConsumerIsRejected},
+};
+
 }  // namespace
 
-int main() {
-  if (const int result = SharedMemoryTransportsExchangeOneMessage();
-      result != 0) {
-    return result;
+int main(int argc, char** argv) {
+  if (argc == 3 && std::string_view(argv[1]) == "--case") {
+    const std::string_view requested(argv[2]);
+    for (const auto& test : kTests) {
+      if (test.name == requested) {
+        return test.run();
+      }
+    }
+    std::cerr << "unknown test case: " << requested << '\n';
+    return 2;
   }
-  if (const int result = ConsumerSleepsUntilProducerPublishes(); result != 0) {
-    return result;
+  if (argc != 1) {
+    std::cerr << "usage: fastipc_tests [--case NAME]\n";
+    return 2;
   }
-  if (const int result = ProducerSleepsUntilConsumerFreesSlot(); result != 0) {
-    return result;
+
+  for (const auto& test : kTests) {
+    const int result = test.run();
+    if (result != 0) {
+      std::cerr << "test case failed: " << test.name << '\n';
+      return result;
+    }
   }
-  if (const int result = EmptyReceiveHonorsAbsoluteDeadline(); result != 0) {
-    return result;
-  }
-  if (const int result = EpochProtocolDoesNotLoseWakeups(); result != 0) {
-    return result;
-  }
-  if (const int result = ProducerRestartAdvancesGenerationAndRestoresFlow();
-      result != 0) {
-    return result;
-  }
-  if (const int result = DuplicateProducerCannotUnlinkLiveChannel();
-      result != 0) {
-    return result;
-  }
-  if (const int result = KilledProducerIsDetectedAndReclaimed();
-      result != 0) {
-    return result;
-  }
-  if (const int result = KilledConsumerIsDetectedAndReclaimed();
-      result != 0) {
-    return result;
-  }
-  if (const int result = GracefulCloseWakesInfinitePeerWait();
-      result != 0) {
-    return result;
-  }
-  if (const int result = StoppedProducerExpiresAndOldGenerationIsFenced();
-      result != 0) {
-    return result;
-  }
-  if (const int result = IdleHeartbeatsPreventFalseTakeover();
-      result != 0) {
-    return result;
-  }
-  return StoppedConsumerExpiresAndOldRoleIsFenced();
+  return 0;
 }
