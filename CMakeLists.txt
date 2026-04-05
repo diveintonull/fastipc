@@ -12,6 +12,7 @@ add_library(
     fastipc
     STATIC
         src/shared_memory_transport.cpp
+        src/unix_domain_socket_transport.cpp
         src/status.cpp)
 add_library(FastIPC::fastipc ALIAS fastipc)
 target_compile_features(fastipc PUBLIC cxx_std_20)
@@ -57,6 +58,24 @@ if(BUILD_TESTING AND FASTIPC_BUILD_TESTS)
                 -Wsign-conversion)
     endif()
     add_test(NAME fastipc.transport COMMAND fastipc_tests)
+
+    add_executable(
+        fastipc_uds_tests
+        tests/unix_domain_socket_test.cpp)
+    target_link_libraries(
+        fastipc_uds_tests
+        PRIVATE FastIPC::fastipc Threads::Threads)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            fastipc_uds_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+                -Wconversion
+                -Wsign-conversion)
+    endif()
+    add_test(NAME fastipc.uds COMMAND fastipc_uds_tests)
 
     set(
         FASTIPC_FAULT_CASES
