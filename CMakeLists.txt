@@ -6,6 +6,7 @@ include(CTest)
 find_package(Threads REQUIRED)
 
 option(FASTIPC_BUILD_TESTS "Build FastIPC behavior tests" ON)
+option(FASTIPC_BUILD_BENCHMARKS "Build the FastIPC benchmark runner" ON)
 option(FASTIPC_BUILD_LEGACY "Expose the imported libsharedmemory target" OFF)
 
 add_library(
@@ -33,6 +34,47 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
             -Wpedantic
             -Wconversion
             -Wsign-conversion)
+endif()
+
+if(FASTIPC_BUILD_BENCHMARKS)
+    set(FASTIPC_SOURCE_REVISION "unknown")
+    find_package(Git QUIET)
+    if(Git_FOUND)
+        execute_process(
+            COMMAND
+                ${GIT_EXECUTABLE}
+                rev-parse
+                --short=12
+                HEAD
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            OUTPUT_VARIABLE FASTIPC_SOURCE_REVISION
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+    endif()
+
+    add_executable(
+        fastipc_benchmark
+        benchmarks/benchmark_main.cpp
+        benchmarks/benchmark_runner.cpp)
+    target_link_libraries(
+        fastipc_benchmark
+        PRIVATE FastIPC::fastipc Threads::Threads)
+    target_compile_definitions(
+        fastipc_benchmark
+        PRIVATE
+            FASTIPC_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+            FASTIPC_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+            FASTIPC_SOURCE_REVISION="${FASTIPC_SOURCE_REVISION}")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            fastipc_benchmark
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+                -Wconversion
+                -Wsign-conversion)
+    endif()
 endif()
 
 if(FASTIPC_BUILD_LEGACY)
@@ -76,6 +118,18 @@ if(BUILD_TESTING AND FASTIPC_BUILD_TESTS)
                 -Wsign-conversion)
     endif()
     add_test(NAME fastipc.uds COMMAND fastipc_uds_tests)
+
+    if(FASTIPC_BUILD_BENCHMARKS)
+        add_test(
+            NAME fastipc.benchmark_smoke
+            COMMAND
+                ${CMAKE_COMMAND}
+                -DFASTIPC_BENCHMARK=$<TARGET_FILE:fastipc_benchmark>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_smoke.cmake)
+        set_tests_properties(
+            fastipc.benchmark_smoke
+            PROPERTIES LABELS benchmark)
+    endif()
 
     set(
         FASTIPC_FAULT_CASES
