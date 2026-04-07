@@ -242,10 +242,55 @@ enum class EndpointLiveness : std::uint8_t {
   return EndpointLiveness::Alive;
 }
 
+[[nodiscard]] EndpointLiveness InspectEndpointForWait(
+    const EndpointMetadata& metadata,
+    std::chrono::milliseconds peer_timeout,
+    std::atomic<std::uint64_t>& next_identity_probe_ns) {
+  const auto pid = AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE);
+  if (pid == 0) {
+    return EndpointLiveness::Vacant;
+  }
+
+  const auto heartbeat =
+      AtomicLoad(&metadata.heartbeat_monotonic_ns, __ATOMIC_ACQUIRE);
+  const auto now = MonotonicNanoseconds();
+  const auto timeout_count =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          peer_timeout).count();
+  const auto timeout_ns = static_cast<std::uint64_t>(timeout_count);
+  const bool heartbeat_expired =
+      heartbeat == 0U ||
+      (now > heartbeat && now - heartbeat > timeout_ns);
+  const bool identity_probe_due =
+      now >= next_identity_probe_ns.load(std::memory_order_relaxed);
+  if (!heartbeat_expired && !identity_probe_due) {
+    return EndpointLiveness::Alive;
+  }
+
+  const auto start_ticks =
+      AtomicLoad(&metadata.process_start_ticks, __ATOMIC_ACQUIRE);
+  if (!ProcessIdentityAlive(pid, start_ticks)) {
+    return EndpointLiveness::ProcessDead;
+  }
+  if (heartbeat_expired) {
+    return EndpointLiveness::HeartbeatExpired;
+  }
+
+  const auto probe_interval_count =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          HeartbeatInterval(peer_timeout)).count();
+  next_identity_probe_ns.store(
+      now + static_cast<std::uint64_t>(probe_interval_count),
+      std::memory_order_relaxed);
+  return EndpointLiveness::Alive;
+}
+
 [[nodiscard]] Status PeerStatus(
     const EndpointMetadata& metadata,
-    std::chrono::milliseconds peer_timeout) {
-  switch (InspectEndpoint(metadata, peer_timeout)) {
+    std::chrono::milliseconds peer_timeout,
+    std::atomic<std::uint64_t>& next_identity_probe_ns) {
+  switch (InspectEndpointForWait(
+      metadata, peer_timeout, next_identity_probe_ns)) {
     case EndpointLiveness::Vacant:
       return Status(StatusCode::PeerUnavailable,
                     "the peer role is not currently owned");
@@ -264,7 +309,8 @@ enum class EndpointLiveness : std::uint8_t {
 [[nodiscard]] Deadline ProbeDeadline(
     const Deadline& requested,
     std::chrono::milliseconds peer_timeout) noexcept {
-  const auto probe_time = Deadline::Clock::now() + peer_timeout;
+  const auto probe_time =
+      Deadline::Clock::now() + HeartbeatInterval(peer_timeout);
   if (!requested.infinite() && requested.time_point() <= probe_time) {
     return requested;
   }
@@ -427,6 +473,7 @@ struct SharedMemoryTransport::Impl {
   std::uint64_t process_start_ticks{0};
   std::uint64_t role_token{0};
   std::atomic<std::uint64_t> observed_generation{0};
+  std::atomic<std::uint64_t> next_peer_identity_probe_ns{0};
   std::mutex heartbeat_mutex;
   std::condition_variable heartbeat_cv;
   std::jthread heartbeat_thread;
@@ -886,7 +933,9 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
                      std::uint64_t{1}, __ATOMIC_RELAXED);
       return Status(StatusCode::Timeout);
     }
-    const auto peer_status = PeerStatus(layout.consumer, impl_->peer_timeout);
+    const auto peer_status = PeerStatus(
+        layout.consumer, impl_->peer_timeout,
+        impl_->next_peer_identity_probe_ns);
     if (!peer_status) {
       return peer_status;
     }
@@ -971,7 +1020,9 @@ Result<std::size_t> SharedMemoryTransport::Receive(
                      std::uint64_t{1}, __ATOMIC_RELAXED);
       return Status(StatusCode::Timeout);
     }
-    const auto peer_status = PeerStatus(layout.producer, impl_->peer_timeout);
+    const auto peer_status = PeerStatus(
+        layout.producer, impl_->peer_timeout,
+        impl_->next_peer_identity_probe_ns);
     if (!peer_status) {
       return peer_status;
     }
