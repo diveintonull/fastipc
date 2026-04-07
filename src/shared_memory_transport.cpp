@@ -349,10 +349,15 @@ enum class EndpointLiveness : std::uint8_t {
   return std::string("/") + std::string(name);
 }
 
-[[nodiscard]] Status ValidatePeerTimeout(const ChannelConfig& config) {
+[[nodiscard]] Status ValidateChannelConfig(const ChannelConfig& config) {
   if (config.peer_timeout <= std::chrono::milliseconds::zero()) {
     return Status(StatusCode::InvalidArgument,
                   "peer_timeout must be positive");
+  }
+  constexpr std::uint32_t maximum_active_spin_count = 65'536U;
+  if (config.active_spin_count > maximum_active_spin_count) {
+    return Status(StatusCode::InvalidArgument,
+                  "active_spin_count must not exceed 65536");
   }
   return Status::Ok();
 }
@@ -456,6 +461,46 @@ struct Geometry {
   return reinterpret_cast<SlotHeader*>(base + offset);
 }
 
+void CpuRelax() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+  __asm__ __volatile__("yield");
+#else
+  std::atomic_signal_fence(std::memory_order_acq_rel);
+#endif
+}
+
+[[nodiscard]] bool SpinForSpace(
+    SharedLayout& layout, std::uint32_t spin_count,
+    std::uint64_t* head) noexcept {
+  for (std::uint32_t iteration = 0; iteration < spin_count; ++iteration) {
+    CpuRelax();
+    *head = AtomicLoad(&layout.producer_cursor.head, __ATOMIC_RELAXED);
+    const auto tail =
+        AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_ACQUIRE);
+    if (*head - tail < layout.queue.slot_count) {
+      return true;
+    }
+  }
+  return false;
+}
+
+[[nodiscard]] bool SpinForData(
+    SharedLayout& layout, std::uint32_t spin_count,
+    std::uint64_t* tail) noexcept {
+  for (std::uint32_t iteration = 0; iteration < spin_count; ++iteration) {
+    CpuRelax();
+    *tail = AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_RELAXED);
+    const auto head =
+        AtomicLoad(&layout.producer_cursor.head, __ATOMIC_ACQUIRE);
+    if (*tail != head) {
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace
 
 struct SharedMemoryTransport::Impl {
@@ -470,6 +515,7 @@ struct SharedMemoryTransport::Impl {
   bool unlink_on_owner_close{false};
   std::atomic<bool> closed{false};
   std::chrono::milliseconds peer_timeout{1000};
+  std::uint32_t active_spin_count{0};
   std::uint64_t process_start_ticks{0};
   std::uint64_t role_token{0};
   std::atomic<std::uint64_t> observed_generation{0};
@@ -571,7 +617,7 @@ struct SharedMemoryTransport::Impl {
 
 [[nodiscard]] Result<std::unique_ptr<SharedMemoryTransport::Impl>>
 SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
-  const auto timeout_validation = ValidatePeerTimeout(config);
+  const auto timeout_validation = ValidateChannelConfig(config);
   if (!timeout_validation) {
     return timeout_validation;
   }
@@ -630,6 +676,7 @@ SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
     impl->object_name = object_name;
     impl->unlink_on_owner_close = config.unlink_on_owner_close;
     impl->peer_timeout = config.peer_timeout;
+  impl->active_spin_count = config.active_spin_count;
 
     const auto validation =
         ValidateLayout(*impl->layout, mapped_bytes, config);
@@ -722,6 +769,7 @@ SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
   impl->owner = true;
   impl->unlink_on_owner_close = config.unlink_on_owner_close;
   impl->peer_timeout = config.peer_timeout;
+  impl->active_spin_count = config.active_spin_count;
 
   std::memset(mapping, 0, geometry.segment_bytes);
   auto& layout = *impl->layout;
@@ -771,7 +819,7 @@ SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
 
 [[nodiscard]] Result<std::unique_ptr<SharedMemoryTransport::Impl>>
 SharedMemoryTransport::OpenConsumerImpl(const ChannelConfig& config) {
-  const auto timeout_validation = ValidatePeerTimeout(config);
+  const auto timeout_validation = ValidateChannelConfig(config);
   if (!timeout_validation) {
     return timeout_validation;
   }
@@ -818,6 +866,7 @@ SharedMemoryTransport::OpenConsumerImpl(const ChannelConfig& config) {
   impl->role = Role::Consumer;
   impl->object_name = object_name;
   impl->peer_timeout = config.peer_timeout;
+  impl->active_spin_count = config.active_spin_count;
 
   const auto validation = ValidateLayout(*impl->layout, mapped_bytes, config);
   if (!validation) {
@@ -933,6 +982,14 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
                      std::uint64_t{1}, __ATOMIC_RELAXED);
       return Status(StatusCode::Timeout);
     }
+    if (SpinForSpace(layout, impl_->active_spin_count, &head)) {
+      break;
+    }
+    if (options.deadline.expired()) {
+      AtomicFetchAdd(&layout.producer_cursor.timeout_count,
+                     std::uint64_t{1}, __ATOMIC_RELAXED);
+      return Status(StatusCode::Timeout);
+    }
     const auto peer_status = PeerStatus(
         layout.consumer, impl_->peer_timeout,
         impl_->next_peer_identity_probe_ns);
@@ -1013,6 +1070,14 @@ Result<std::size_t> SharedMemoryTransport::Receive(
     const auto head =
         AtomicLoad(&layout.producer_cursor.head, __ATOMIC_ACQUIRE);
     if (tail != head) {
+      break;
+    }
+    if (deadline.expired()) {
+      AtomicFetchAdd(&layout.consumer_cursor.timeout_count,
+                     std::uint64_t{1}, __ATOMIC_RELAXED);
+      return Status(StatusCode::Timeout);
+    }
+    if (SpinForData(layout, impl_->active_spin_count, &tail)) {
       break;
     }
     if (deadline.expired()) {

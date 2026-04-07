@@ -13,6 +13,7 @@ struct ChannelConfig {
   std::string name;
   std::uint32_t slot_count{64};
   std::uint32_t max_message_size{4096};
+  std::uint32_t active_spin_count{256};
   std::uint32_t permissions{0600};
   bool unlink_on_owner_close{false};
   std::chrono::milliseconds peer_timeout{1000};

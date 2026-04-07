@@ -816,6 +816,18 @@ int StoppedConsumerExpiresAndOldRoleIsFenced() {
 }
 
 
+int ExcessiveActiveSpinBudgetIsRejected() {
+  using fastipc::SharedMemoryTransport;
+  using fastipc::StatusCode;
+
+  auto config = ConfigFor("fastipc_spin_budget");
+  config.active_spin_count = 1'000'001U;
+  const auto result = SharedMemoryTransport::CreateProducer(config);
+  CHECK(!result.ok());
+  CHECK(result.status().code() == StatusCode::InvalidArgument);
+  return 0;
+}
+
 int PeerMissingHasTypedStatus() {
   using fastipc::SharedMemoryTransport;
   using fastipc::StatusCode;
@@ -1005,6 +1017,7 @@ constexpr std::array kTests{
               StoppedProducerExpiresAndOldGenerationIsFenced},
     NamedTest{"idle_heartbeat", IdleHeartbeatsPreventFalseTakeover},
     NamedTest{"stale_consumer", StoppedConsumerExpiresAndOldRoleIsFenced},
+    NamedTest{"spin_budget", ExcessiveActiveSpinBudgetIsRejected},
     NamedTest{"peer_missing", PeerMissingHasTypedStatus},
     NamedTest{"queue_full", FullQueueAppliesDropAndTimeoutPolicies},
     NamedTest{"malformed_header", MalformedHeaderIsRejected},
