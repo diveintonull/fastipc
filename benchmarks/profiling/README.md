@@ -128,3 +128,53 @@ and retain per-message `operation_sequence` updates for progress detection.
 
 Both changes must pass the full fault matrix and sanitizer matrix before their
 measurements count.
+
+
+## Experiment 1 result  identity-probe amortization plus bounded spin
+
+Artifacts preserve both the first change and the evidence-driven correction:
+
+- `experiment1-probe-only-e609fa8-*`: full identity reads were amortized,
+  with no active spin.
+- `experiment1-bounded-spin-f24f832-*`: the same liveness design plus the
+  public, bounded 256-relax default.
+
+Median-throughput repetitions from the same five-run workload were:
+
+| Metric | Baseline `6da1a9e` | Probe only `e609fa8` | Bounded spin `f24f832` |
+| --- | ---: | ---: | ---: |
+| Logical messages/s | 153,825.684 | 84,453.358 | 209,670.456 |
+| Wall time | 2,600.346 ms | 4,736.342 ms | 1,907.756 ms |
+| P50 RTT | 4.074 us | 21.902 us | 0.922 us |
+| P95 RTT | 34.345 us | 34.013 us | 32.364 us |
+| P99 RTT | 54.549 us | 54.362 us | 49.771 us |
+| Summed CPU time | 2,799.776 ms | 2,239.723 ms | 1,445.745 ms |
+| Voluntary context switches | 161,403 | 399,942 | 139,654 |
+
+The probe-only version removed the intended filesystem/iostream work, and its
+`perf stat` task-clock fell from 2,654.07 ms to 1,659.18 ms. However, it
+entered futex sleep too readily: context switches increased 147.791 percent and
+throughput fell 45.098 percent. The corresponding flat report had no
+`ProcessStartTicks` or iostream hot symbols; `syscall` rose to 23.90 percent
+of user CPU samples and `FutexWait` to 5.88 percent. This intermediate result
+was rejected as the final wait policy rather than hidden.
+
+Adding a 256-iteration CPU-relax phase made the intended policy explicit and
+bounded. Relative to baseline, the formal `f24f832` median showed:
+
+- 36.304 percent more logical messages/s;
+- 48.362 percent less summed CPU time;
+- 13.475 percent fewer voluntary context switches;
+- 77.369 percent lower P50 RTT;
+- lower measured P95 and P99 RTT in this run.
+
+Its `perf stat` task-clock was 1,259.58 ms. The flat report no longer contained
+process-stat parsing symbols; `syscall` was 12.03 percent and `FutexWait`
+0.57 percent. `Receive` itself accounted for 62.18 percent of samples because
+the intentional active-spin loop now owns the user-space waiting work. That
+percentage is not interpreted as a regression by itself; the wall, CPU, latency,
+and context-switch measurements determine the outcome.
+
+The final design accepts a tunable latency-versus-CPU trade-off: zero disables
+active spin, 256 is the measured default, and values above 65,536 are rejected.
+The full Debug suite passed 15/15 before the implementation commits.
