@@ -1,0 +1,6 @@
+# started on Thu Aug 20 14:49:40 2026
+
+1239.93,msec,task-clock:u,3.69%,1229085925,100.00,0.667,CPUs utilized
+0,,context-switches:u,0.00%,1229085925,100.00,0.000,/sec
+0,,cpu-migrations:u,0.00%,1229085925,100.00,0.000,/sec
+634,,page-faults:u,0.09%,1229085925,100.00,511.321,/sec

@@ -178,3 +178,47 @@ and context-switch measurements determine the outcome.
 The final design accepts a tunable latency-versus-CPU trade-off: zero disables
 active spin, 256 is the measured default, and values above 65,536 are rejected.
 The full Debug suite passed 15/15 before the implementation commits.
+
+
+## Experiment 2 result  heartbeat-thread timestamp ownership
+
+Artifacts:
+
+- [experiment2-heartbeat-thread-866d32b-stat.csv](experiment2-heartbeat-thread-866d32b-stat.csv)
+- [experiment2-heartbeat-thread-866d32b-runs.jsonl](experiment2-heartbeat-thread-866d32b-runs.jsonl)
+- [experiment2-heartbeat-thread-866d32b-record-run.jsonl](experiment2-heartbeat-thread-866d32b-record-run.jsonl)
+- [experiment2-heartbeat-thread-866d32b-report.txt](experiment2-heartbeat-thread-866d32b-report.txt)
+
+The before case is the accepted experiment-1 revision `f24f832`; the after case
+is `866d32b`. Both used the same build flags, perf commands, payload, warmup,
+and five measured repetitions.
+
+| Metric | Before `f24f832` | After `866d32b` | Change |
+| --- | ---: | ---: | ---: |
+| Logical messages/s | 209,670.456 | 216,994.748 | +3.493% |
+| Wall time | 1,907.756 ms | 1,843.363 ms | -3.375% |
+| P50 RTT | 0.922 us | 0.895 us | -2.928% |
+| P95 RTT | 32.364 us | 27.601 us | -14.717% |
+| P99 RTT | 49.771 us | 45.062 us | -9.461% |
+| Summed CPU time | 1,445.745 ms | 1,434.544 ms | -0.775% |
+| Voluntary context switches | 139,654 | 142,183 | +1.811% |
+
+`perf stat` task-clock fell from 1,259.58 ms to 1,239.93 ms (-1.560
+percent). In the flat sampling report, `__vdso_clock_gettime` fell from 5.16
+percent to 4.31 percent of user CPU samples. Sampling percentages are noisy and
+not additive; the wall/latency/CPU measurements are the acceptance evidence.
+
+The small 1.811 percent context-switch increase is reported rather than hidden.
+It is within the run-to-run scheduling variation observed on WSL2, while all
+three latency quantiles, throughput, wall time, task-clock, and summed CPU moved
+in the intended direction. The change is retained because it also gives one
+component clear ownership of the lease timestamp.
+
+Relative to the original `6da1a9e` baseline, the final `866d32b` median
+showed 41.065 percent more messages/s, 48.762 percent less summed CPU time,
+11.908 percent fewer voluntary context switches, and P50/P95/P99 reductions of
+78.031/19.636/17.392 percent. These are results for this one 64 B WSL2
+ping-pong experiment, not claims for every payload or deployment.
+
+The full Debug suite passed 15/15 after experiment 2. Release and sanitizer
+matrices are recorded separately before project completion.
