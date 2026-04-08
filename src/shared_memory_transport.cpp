@@ -1033,8 +1033,6 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
   FutexWake(&layout.producer_cursor.data_epoch);
   AtomicFetchAdd(&layout.producer_cursor.sent_messages, std::uint64_t{1},
                  __ATOMIC_RELAXED);
-  AtomicStore(&layout.producer.heartbeat_monotonic_ns, MonotonicNanoseconds(),
-              __ATOMIC_RELEASE);
   AtomicFetchAdd(&layout.producer.operation_sequence, std::uint64_t{1},
                  __ATOMIC_RELAXED);
   return Status::Ok();
@@ -1138,8 +1136,6 @@ Result<std::size_t> SharedMemoryTransport::Receive(
   FutexWake(&layout.consumer_cursor.space_epoch);
   AtomicFetchAdd(&layout.consumer_cursor.received_messages, std::uint64_t{1},
                  __ATOMIC_RELAXED);
-  AtomicStore(&layout.consumer.heartbeat_monotonic_ns, MonotonicNanoseconds(),
-              __ATOMIC_RELEASE);
   AtomicFetchAdd(&layout.consumer.operation_sequence, std::uint64_t{1},
                  __ATOMIC_RELAXED);
   return static_cast<std::size_t>(length);
