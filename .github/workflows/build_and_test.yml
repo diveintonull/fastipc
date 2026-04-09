@@ -1,160 +1,69 @@
-name: Build and Test
+name: FastIPC CI
 
 on:
   push:
     branches:
       - main
   pull_request:
-    branches:
-      - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  build:
-    permissions:
-      contents: read
-    runs-on: ${{ matrix.os }}
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        build_type: [Release]
         include:
-          - os: ubuntu-latest
-            cc: gcc
-            cxx: g++
-          - os: macos-latest
-            cc: clang
-            cxx: clang++
-          - os: windows-latest
-            cc: cl
-            cxx: cl
+          - name: Debug
+            build_type: Debug
+            cxx_flags: ""
+            linker_flags: ""
+          - name: Release
+            build_type: Release
+            cxx_flags: ""
+            linker_flags: ""
+          - name: ASan
+            build_type: Debug
+            cxx_flags: "-fsanitize=address -fno-omit-frame-pointer"
+            linker_flags: "-fsanitize=address"
+          - name: UBSan
+            build_type: Debug
+            cxx_flags: "-fsanitize=undefined -fno-omit-frame-pointer"
+            linker_flags: "-fsanitize=undefined"
+          - name: TSan
+            build_type: Debug
+            cxx_flags: "-fsanitize=thread -fno-omit-frame-pointer"
+            linker_flags: "-fsanitize=thread"
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup CMake
-        uses: jwlawson/actions-setup-cmake@master
+      - name: Install Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ninja-build
 
-      - name: Configure CMake
-        run: cmake -B build
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE="${{ matrix.build_type }}" \
+            -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.linker_flags }}" \
+            -DFASTIPC_BUILD_TESTS=ON \
+            -DFASTIPC_BUILD_BENCHMARKS=ON
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build build --parallel 2
 
       - name: Test
-        run: cmake --build build --config Release --target run_test
         env:
-          LSM_NOFLAKE: 1
-
-      - name: Benchmark (contention)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          cmake --build build --config Release --target lsm_bench
-          ./build/test/lsm_bench
-
-  release:
-    runs-on: ubuntu-latest
-    needs: build
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Determine library version
-        id: version
-        run: |
-          python - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-
-          header = Path('include/libsharedmemory/libsharedmemory.hpp').read_text(encoding='utf-8')
-
-          def macro(name: str) -> str:
-              match = re.search(rf'#define\s+{name}\s+(\d+)', header)
-              if not match:
-                  raise SystemExit(f'Macro {name} not found in header')
-              return match.group(1)
-
-          major = macro('LIBSHAREDMEMORY_VERSION_MAJOR')
-          minor = macro('LIBSHAREDMEMORY_VERSION_MINOR')
-          patch = macro('LIBSHAREDMEMORY_VERSION_PATCH')
-          version = f'v{major}.{minor}.{patch}'
-
-          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
-              output.write(f'version={version}\n')
-          PY
-
-      - name: Check if tag already exists
-        id: tag_check
-        run: |
-          git fetch --tags --force
-          if git rev-parse "${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
-            echo "exists=true" >>"$GITHUB_OUTPUT"
-            exit 1
-          else
-            echo "exists=false" >>"$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-      - name: Generate release notes
-        if: steps.tag_check.outputs.exists == 'false'
-        id: notes
-        run: |
-          python - <<'PY'
-          import os
-          import subprocess
-
-          def git_output(args):
-              result = subprocess.run(args, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-              return result.stdout.strip()
-
-          last_tag = ""
-          try:
-              last_tag = git_output(["git", "describe", "--tags", "--abbrev=0"])
-          except subprocess.CalledProcessError:
-              last_tag = ""
-
-          if last_tag:
-              log_range = f"{last_tag}..HEAD"
-          else:
-              log_range = "HEAD"
-
-          try:
-              notes = git_output(["git", "log", log_range, "--pretty=format:- %s (%h)"])
-          except subprocess.CalledProcessError:
-              notes = ""
-
-          notes = notes.strip()
-          if not notes:
-              notes = "No commits since previous release."
-
-          if last_tag:
-              header = f"Changes since {last_tag}:"
-          else:
-              header = "Changes since repository start:"
-
-          body = f"{header}\n\n{notes}"
-
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write("body<<EOF\n")
-              fh.write(body)
-              fh.write("\nEOF\n")
-          PY
-
-      - name: Create GitHub release
-        if: steps.tag_check.outputs.exists == 'false'
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.version.outputs.version }}
-          release_name: ${{ steps.version.outputs.version }}
-          commitish: ${{ github.sha }}
-          body: ${{ steps.notes.outputs.body }}
-          draft: false
-          prerelease: false
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: ctest --test-dir build --output-on-failure
