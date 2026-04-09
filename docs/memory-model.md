@@ -87,14 +87,22 @@ converts remaining duration to one CLOCK_MONOTONIC absolute timespec and uses
 FUTEX_WAIT_BITSET. EINTR, EAGAIN, and spurious wakes cannot extend the deadline
 because each conversion derives from the original target.
 
-## Peer death and bounded probes
+## Peer death, active spin, and bounded probes
 
-A blocked operation has two absolute deadlines: the caller's deadline and the
-next liveness probe. FastIPC waits until the earlier one. A liveness-probe
-timeout returns to the queue predicate instead of being reported as a caller
-timeout. The next loop checks the peer's released PID, Linux process-start
-ticks, and heartbeat lease. A missing PID is PeerUnavailable; a vanished or recycled
-process identity, or an expired heartbeat, is PeerDead.
+On a full or empty queue, FastIPC first performs at most `active_spin_count`
+predicate checks. This avoids a syscall when the peer is expected to publish or
+consume within a short interval, but the configured bound prevents an
+uncontrolled busy wait.
+
+After spinning, a blocked operation has two absolute deadlines: the caller
+deadline and the next liveness probe. FastIPC waits until the earlier one. A
+liveness-probe timeout returns to the queue predicate instead of being reported
+as a caller timeout. Each blocked loop reads the peer released PID and
+heartbeat. The comparatively expensive `/proc/<pid>/stat` start-tick check is
+amortized: it runs when the heartbeat is already expired or when the next
+identity-probe timestamp is due, currently once per heartbeat interval. A
+missing PID is `PeerUnavailable`; a vanished or recycled process identity, or
+an expired heartbeat, is `PeerDead`.
 
 Every claimed endpoint owns one control-plane jthread. It refreshes heartbeat
 at clamp(peer_timeout / 4, 1 ms, 250 ms), including while the data plane is

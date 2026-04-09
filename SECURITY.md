@@ -1,13 +1,22 @@
-# Security Policy
+# Security policy
 
-## Supported Versions
+FastIPC is an educational derivative project and currently has no
+production-supported release line or security-response SLA.
 
-We do our best to maintain security in all versions of `libsharedmemory`.
+Report suspected vulnerabilities through this repository's private GitHub
+Security Advisory / private vulnerability-reporting interface when available.
+If that interface is unavailable, contact the current repository owner through
+a private channel before disclosing exploit details publicly.
 
-## Reporting a Vulnerability
+Do not send FastIPC reports to the upstream `libsharedmemory` maintainer unless
+the issue is independently reproduced in unmodified upstream code. FastIPC's
+rewritten layout, transports, recovery logic, and API are maintained here.
 
-Should you discover a security vulnerability in `libsharedmemory` or one of the packages/projects affiliated with it, please report it to us immediately by emailing [info@aron-homberg.de](mailto:info@aron-homberg.de).
+Please include:
 
-Please do NOT report security vulnerabilities in public forums, issue trackers, or social media. This is to prevent malicious actors from exploiting the vulnerability before we have a chance to fix it.
-
-As this is an Open Source project without financial backing, we cannot offer bounties for security vulnerabilities right now.
+- affected revision and Linux/kernel details;
+- transport and configuration;
+- minimal reproduction;
+- expected versus observed behavior;
+- sanitizer or crash output;
+- whether untrusted local users can reach the channel namespace.

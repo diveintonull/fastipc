@@ -1,5 +1,5 @@
 .cache
-build
+build*/
 .idea
 cmake-build-*
 _codeql_build_dir

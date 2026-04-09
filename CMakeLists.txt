@@ -7,7 +7,6 @@ find_package(Threads REQUIRED)
 
 option(FASTIPC_BUILD_TESTS "Build FastIPC behavior tests" ON)
 option(FASTIPC_BUILD_BENCHMARKS "Build the FastIPC benchmark runner" ON)
-option(FASTIPC_BUILD_LEGACY "Expose the imported libsharedmemory target" OFF)
 
 add_library(
     fastipc
@@ -75,15 +74,6 @@ if(FASTIPC_BUILD_BENCHMARKS)
                 -Wconversion
                 -Wsign-conversion)
     endif()
-endif()
-
-if(FASTIPC_BUILD_LEGACY)
-    add_library(fastipc_upstream_legacy INTERFACE)
-    target_compile_features(fastipc_upstream_legacy INTERFACE cxx_std_20)
-    target_include_directories(
-        fastipc_upstream_legacy
-        INTERFACE
-            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 endif()
 
 if(BUILD_TESTING AND FASTIPC_BUILD_TESTS)

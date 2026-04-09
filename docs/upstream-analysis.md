@@ -141,15 +141,20 @@ resident memory, so this audit makes no performance claim.
   conflict, corruption, and shutdown.
 - Backpressure as explicit Block, Timeout, and Drop policies with metrics.
 
-### Remove
+### Exclude from the compiled derivative
 
 - Windows/macOS implementations from the focused Linux core.
 - Legacy last-value streams and FFI surfaces that bypass the new lifecycle.
 - Process-shared spin locks and the shared count hot spot.
 - Implicit 0777 permissions and unlink-before-create behavior.
 
-Removal does not erase attribution: imported commits and licenses remain even
-when inherited files are later deleted.
+The current top-level CMake graph exposes only the new `FastIPC::fastipc`
+library, its tests, and its benchmark. Imported examples, FFI bindings, the
+single-header implementation, and old tests remain as historical files and in
+Git history, but no current target includes or links them. Physical deletion
+was not performed without separate authorization for that destructive scope.
+This quarantine preserves attribution without claiming legacy behavior as a
+FastIPC capability.
 
 ### Add
 

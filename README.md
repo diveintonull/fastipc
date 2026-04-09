@@ -1,451 +1,216 @@
 # FastIPC
 
-## Upstream and Attribution
+FastIPC is a Linux C++20 IPC library built as a deep, attributed derivative of
+`kyr0/libsharedmemory`. The current core provides a versioned SPSC
+shared-memory channel, futex blocking with absolute deadlines, peer
+liveness/restart fencing, explicit backpressure, and a common transport seam
+implemented by shared memory and Unix domain sockets.
 
-FastIPC is a deep derivative of
-[kyr0/libsharedmemory](https://github.com/kyr0/libsharedmemory), pinned at
-9e24caaefb28826e99a33be2dd1350725558dd80 and distributed under MIT. The
-original history, LICENSE, copyright notices, and Boost Software License notice
-in test/lest.hpp are preserved.
+This project has not undergone a production security review and is not a
+replacement for iceoryx, eCAL, or a security-reviewed IPC stack.
 
-The baseline supplies the initial named-memory wrapper, legacy streams/queue,
-and build scaffold. FastIPC is redesigning Linux mapping lifecycle, layout,
-synchronization, blocking, liveness/restart, transport API, tests, and
-performance engineering. docs/upstream-analysis.md records the exact boundary.
+## Capabilities
 
-The remainder is the imported upstream README. It describes the baseline, not
-yet every target capability.
-# libsharedmemory
+- Linux POSIX shared-memory mapping with creator/open validation and mode 0600
+  defaults;
+- versioned, endian-marked layout with total size, initialization state, and
+  generation;
+- cache-line-isolated SPSC head/tail cursors and fixed-capacity slots;
+- audited acquire/release publication without `memory_order_seq_cst`;
+- futex epochs, recheck-before-sleep, monotonic absolute deadlines, and bounded
+  active spin;
+- PID, Linux process-start ticks, role token, heartbeat lease, and generation
+  fencing;
+- producer/consumer crash detection, stale segment recovery, and restart flow;
+- Block, Timeout, and Drop backpressure with typed `Status` values and
+  counters;
+- `Transport` API with `SharedMemoryTransport` and
+  `UnixDomainSocketTransport`;
+- UDS `SOCK_SEQPACKET` inline frames through 64 KiB and sealed-memfd
+  descriptor transfer for larger payloads;
+- cross-process benchmark matrix for 64 B through 1 MiB, with pipe as a third
+  baseline;
+- automated Debug, Release, ASan, UBSan, and TSan coverage.
 
-A lightweight, header-only C++20 library for inter-process communication via shared memory. Transfer data between isolated OS processes - or between modules written in different programming languages - with a simple, cross-platform API.
+## Architecture
 
-**Important:** v2.0.0 introduces a wire-layout breaking change for stream and queue metadata. Existing processes built against the old in-memory format must not interoperate with this new build until all participants are updated together.
-
-**v1.10.0 is the most stable v1 release and is recommended if you need strict compatibility with existing v1 participants.**
-
-<img src="https://github.com/kyr0/libsharedmemory/raw/master/screenshot.png" alt="Screenshot of libsharedmemory in action" width="300">
-
-**Key capabilities:**
-- Stream-based read/write transfer (`std::string`, `float*`, `double*`, scalars)
-    - FIFO message queue (`SharedMemoryQueue`) with atomic operations
-    - Optional persistence for shared memory segments
-- Change detection via flag bit flipping
-
-## Supported Platforms
-
-| Platform | Architecture |
-|---|---|
-| Windows | x86_64 |
-| Linux | x86_64, aarch64 |
-| macOS | x86_64, aarch64 (Apple Silicon) |
-
-## Building
-
-Requires CMake 3.12+ and a C++20 compatible compiler.
-
-```sh
-make setup    # Install cmake (auto-detects OS package manager)
-make build    # Configure and build (Release)
-make test     # Build and run all tests
-make examples # Build and run all examples (stream, queue, raw C)
-make bench    # Build and run contention benchmark
-make clean    # Remove build artifacts
+```text
+Application
+    |
+    v
+Transport { Send, Receive, Stats, Close }
+    |
+    +-- SharedMemoryTransport
+    |      +-- versioned mapped layout
+    |      +-- bounded SPSC ring
+    |      +-- active spin -> futex epoch wait
+    |      +-- generation / role / heartbeat control plane
+    |
+    +-- UnixDomainSocketTransport
+           +-- AF_UNIX SOCK_SEQPACKET
+           +-- inline frame or sealed memfd + SCM_RIGHTS
 ```
 
-Or use CMake directly:
+Shared memory uses two ownership planes:
 
-```sh
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+- data plane: one producer owns `head` and slot writes; one consumer owns
+  `tail` and slot reads;
+- control plane: role claims, generation, PID/start-ticks identity, heartbeat,
+  and cleanup.
+
+The heartbeat jthread exclusively refreshes the lease timestamp. Successful
+message operations increment an independent progress sequence.
+
+## Build and test
+
+From this directory:
+
+```bash
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFASTIPC_BUILD_TESTS=ON \
+  -DFASTIPC_BUILD_BENCHMARKS=ON
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-## Benchmark (Contention)
+The default build produces:
 
-Previously, this library did not support multiple writers or producers, so contention was not a concern. With v2.0.0's new locking mechanisms for correctness under concurrent access, we expect some performance drop under contention **for multi-threaded workloads**. However, single-writer/single-producer performance **should remain largely unaffected**.
+- `FastIPC::fastipc`, the static library target;
+- `fastipc_tests`, the shared-memory behavior/fault executable;
+- `fastipc_uds_tests`, the Unix-socket behavior/hostile-input executable;
+- `fastipc_benchmark`, the JSONL benchmark runner.
 
-Run benchmark:
-
-```sh
-make bench
-```
-
-Latest local sample (macOS 15, MacBook Air M4):
-
-- Stream writers:
-
-  - 1 thread: 9.14M ops/s (baseline)
-  - 4 threads: 8.59M ops/s (6.1% drop vs 1t)
-  - 8 threads: 6.32M ops/s (30.9% drop vs 1t)
-
-- Queue producers:
-
-  - 1 thread: 5.24M ops/s (baseline)
-  - 2 threads: 4.40M ops/s (16.1% drop)
-  - 4 threads: 3.95M ops/s (24.7% drop)
-  - 8 threads: 3.38M ops/s (35.5% drop)
-
-- Queue consumers:
-
-  - 1 thread: 7.13M ops/s (baseline)
-  - 2 threads: 5.77M ops/s (19.1% drop)
-  - 4 threads: 4.20M ops/s (41.1% drop)
-  - 8 threads: 3.44M ops/s (51.8% drop)
-
-Notes:
-- Results are machine-dependent and workload-dependent.
-- Minor non-monotonic scaling at low thread counts is possible due to scheduler/cache effects.
-
-## Third-party integrations
-
-### OpenFrameworks (`ofxSharedMemory`)
-
-[@funatsufumiya](https://github.com/funatsufumiya) ported `libsharedmemory` to OpenFrameworks. Check out [ofxSharedMemory](https://github.com/funatsufumiya/ofxSharedMemory) if you're using OpenFrameworks!
-
-## Examples
-
-### Stream-based Transfer
+## Shared-memory example
 
 ```cpp
-std::string data = R"({ "status": "connected", "protocol": "shm" })";
+#include <fastipc/shared_memory_transport.hpp>
 
-// Create writer and reader (name is OS-wide, size in bytes, up to 4 GiB)
-SharedMemoryWriteStream writer{"myChannel", /*size*/ 65535, /*persistent*/ true};
-SharedMemoryReadStream reader{"myChannel", /*size*/ 65535, /*persistent*/ true};
+#include <array>
+#include <chrono>
+#include <cstddef>
 
-writer.write(data);
+using namespace std::chrono_literals;
 
-// Read from the same or another process, thread, or application
-std::string result = reader.readString();
-```
+fastipc::ChannelConfig config;
+config.name = "sensor_frames";
+config.slot_count = 64;
+config.max_message_size = 4096;
+config.unlink_on_owner_close = true;
 
-### Message Queue (C++20)
-
-```cpp
-SharedMemoryQueue writer{"queue", /*capacity*/ 10, /*maxMessageSize*/ 256, /*persistent*/ true, /*isWriter*/ true};
-SharedMemoryQueue reader{"queue", /*capacity*/ 10, /*maxMessageSize*/ 256, /*persistent*/ true, /*isWriter*/ false};
-
-writer.enqueue("First message");
-writer.enqueue("Second message");
-
-std::string msg;
-if (reader.dequeue(msg)) {
-    std::cout << "Received: " << msg << std::endl;
+auto producer_result =
+    fastipc::SharedMemoryTransport::CreateProducer(config);
+auto consumer_result =
+    fastipc::SharedMemoryTransport::OpenConsumer(config);
+if (!producer_result || !consumer_result) {
+  // Inspect result.status(); setup failures are typed.
+  return;
 }
 
-// Peek without removing
-if (reader.peek(msg)) {
-    std::cout << "Next: " << msg << std::endl;
-}
+auto producer = std::move(producer_result).take_value();
+auto consumer = std::move(consumer_result).take_value();
 
-std::cout << "Size: " << reader.size() << ", Empty: " << reader.isEmpty() << std::endl;
+const std::array<std::byte, 3> payload{
+    std::byte{0x01}, std::byte{0x02}, std::byte{0x03}};
+auto sent = producer->Send(
+    payload,
+    fastipc::SendOptions{
+        fastipc::BackpressurePolicy::Block,
+        fastipc::Deadline::After(100ms)});
+
+std::array<std::byte, 4096> destination{};
+auto received =
+    consumer->Receive(destination, fastipc::Deadline::After(100ms));
 ```
 
-### Raw Shared Memory (C)
-
-A thin C wrapper (`example/lsm_c.h`) exposes the `Memory` class as opaque-handle functions, so plain C code can create segments and read/write bytes directly:
-
-```c
-#include "lsm_c.h"
-#include <stdio.h>
-#include <string.h>
-
-int main(void)
-{
-    const char* message = "Hello from C!";
-
-    lsm_memory* writer = lsm_create("cExample", 256, /*persistent*/ 1);
-    memcpy(lsm_data(writer), message, strlen(message) + 1);
-
-    lsm_memory* reader = lsm_open("cExample", 256, /*persistent*/ 1);
-    printf("Received: %s\n", (const char*)lsm_data(reader));
-
-    lsm_close(reader); lsm_free(reader);
-    lsm_close(writer); lsm_destroy(writer); lsm_free(writer);
-    return 0;
-}
-```
-
-### Rust FFI (interop with C++)
-
-The `ffi/rust/` crate provides safe Rust bindings that link against the C wrapper at build time via `cc`. No separate C++ build step is needed - `cargo build` compiles everything.
-
-```rust
-use libsharedmemory::SharedMemory;
-
-fn main() {
-    // Writer: create a shared memory segment
-    let writer = SharedMemory::create("rustExample", 256, true)
-        .expect("Failed to create shared memory");
-    writer.as_mut_slice()[..16].copy_from_slice(b"Hello from Rust!");
-
-    // Reader: open the same segment (could be a C++ process on the other end)
-    let reader = SharedMemory::open("rustExample", 256, true)
-        .expect("Failed to open shared memory");
-    println!("{}", std::str::from_utf8(&reader.as_slice()[..16]).unwrap());
-}
-```
-
-```sh
-cd ffi/rust
-make setup      # Set Rust toolchain to stable
-make build      # Compile the crate (includes C++ wrapper)
-make test       # Run unit tests
-make example    # Run the shared_memory example
-```
-
-### Zig FFI (interop with C++)
-
-The `ffi/zig/` package uses Zig's `@cImport` to directly consume the C header and compiles the C++ wrapper as part of `zig build`. No external build step required.
-
-```zig
-const lsm = @import("lsm");
-const std = @import("std");
-
-pub fn main() !void {
-    const message = "Hello from Zig!";
-
-    // Writer: create a shared memory segment
-    const writer = try lsm.SharedMemory.create("zigExample", 256, true);
-    defer writer.deinit();
-
-    const wbuf = writer.data();
-    @memcpy(wbuf[0..message.len], message);
-
-    // Reader: open the same segment (could be a C++ process on the other end)
-    const reader = try lsm.SharedMemory.open("zigExample", 256, true);
-    defer reader.close();
-
-    std.debug.print("Received: {s}\n", .{reader.data()[0..message.len]});
-}
-```
-
-```sh
-cd ffi/zig
-make setup      # Install Zig (auto-detects OS package manager)
-make build      # Compile (includes C++ wrapper)
-make test       # Run unit tests
-make example    # Run the shared_memory example
-```
-
-### Go FFI (interop with C)
-
-The `ffi/go/` package uses cgo to link against the C wrapper. The Makefile compiles `lsm_c.cpp` into a static library, then `go build` links it automatically.
-
-```go
-package main
-
-import (
-	"fmt"
-	lsm "libsharedmemory"
-)
-
-func main() {
-	// Writer: create a shared memory segment
-	writer, _ := lsm.Create("goExample", 256, true)
-	defer writer.Close()
-
-	writer.Write([]byte("Hello from Go!"))
-
-	// Reader: open the same segment (could be a C++ process on the other end)
-	reader, _ := lsm.Open("goExample", 256, true)
-	defer reader.Close()
-
-	fmt.Printf("Received: %s\n", reader.Data()[:14])
-}
-```
-
-```sh
-cd ffi/go
-make setup      # Install Go (auto-detects OS package manager)
-make build      # Compile C++ wrapper + go build
-make test       # Run unit tests
-make example    # Run the shared_memory example
-```
-
-### Running the Examples
-
-```sh
-make examples                # Build and run all examples (stream, queue, raw C)
-cd ffi/rust && make example  # Rust FFI example
-cd ffi/zig && make example   # Zig FFI example
-cd ffi/go && make example    # Go FFI example
-```
-
-## Features
-
-### Stream-based Transfer
-- `std::string` (UTF-8 compatible), `float*`, `double*` arrays
-- Single value access via `.data()[index]` for all C/C++ scalar types
-- Revision/ack-based change detection with writer/reader synchronization for contention safety
-
-### Message Queue
-- Thread-safe enqueue/dequeue using atomic counters and shared producer/consumer locks
-- Configurable capacity and maximum message size
-- Peek functionality to inspect without consuming
-- Supports multi-producer and multi-consumer contention safety in the current wire format
-
-## Integration (C++ codebase)
-
-Copy `include/libsharedmemory/libsharedmemory.hpp` into your project's include path - it's a single header.
-
-## Memory Layout
-
-### Stream (`SharedMemoryWriteStream` / `SharedMemoryReadStream`)
-
-Each named shared memory segment includes extended metadata in v2.0.0:
-
-| Field | Type | Size | Description |
-|---|---|---|---|
-| `flags` | `char` | 1 byte | Data type + compatibility change bit |
-| `padding` | `char[3]` | 3 bytes | Align metadata fields to 4-byte boundary |
-| `revision` | `uint32` | 4 bytes | Monotonic write revision counter |
-| `ack` | `uint32` | 4 bytes | Last revision acknowledged by reader |
-| `size` | `uint32` | 4 bytes | Payload size in bytes |
-| `lock` | `atomic<uint32>` | 4 bytes | Shared stream lock for coherent reads/writes |
-| `data` | `byte[]` | variable | Payload (string, float[], double[]) |
-
-Binary layout: `|flags(1)|pad(3)|revision(4)|ack(4)|size(4)|lock(4)|data(...)|`
-
-```c
-enum DataType {
-  kMemoryChanged = 1,   // compatibility bit (legacy readers)
-  kMemoryTypeString = 2,
-  kMemoryTypeFloat = 4,
-  kMemoryTypeDouble = 8,
-};
-```
-
-In v2.0.0, unread update detection is revision/ack-based; `kMemoryChanged` remains for compatibility.
-
-### Queue (`SharedMemoryQueue`)
-
-| Field | Type | Offset | Description |
-|---|---|---|---|
-| `writeIndex` | `uint32` | 0 | Next slot to write |
-| `readIndex` | `uint32` | 4 | Next slot to read |
-| `capacity` | `uint32` | 8 | Max number of messages |
-| `count` | `atomic<uint32>` | 12 | Current message count |
-| `maxMessageSize` | `uint32` | 16 | Max bytes per message |
-| `producerLock` | `atomic<uint32>` | 20 | Shared producer-side lock |
-| `consumerLock` | `atomic<uint32>` | 24 | Shared consumer-side lock |
-| `messages` | slot[] | 28+ | `capacity` × `[length(4)\|data(maxMessageSize)]` |
-
-Binary layout: 
-`|header(28)|slot0|slot1|...|slotN|` where each slot is: 
-`|length(4)|data(maxMessageSize)|`
-
-## Architecture
-
-### Stream: Contention-Safe Writer/Reader
-
-```mermaid
-flowchart LR
-    subgraph "Process A (Writer)"
-        W[SharedMemoryWriteStream]
-    end
-
-    subgraph "OS Shared Memory"
-        SHM["Named Segment\n|flags|pad|revision|ack|size|lock|data|"]
-    end
-
-    subgraph "Process B (Reader)"
-        R[SharedMemoryReadStream]
-    end
-
-    W -- "write()" --> SHM
-    SHM -- "readString()" --> R
-```
-
-### Queue: Multi-Producer / Multi-Consumer (Lock-Serialized)
-
-```mermaid
-flowchart LR
-    subgraph "Process A..N (Producers)"
-        P[SharedMemoryQueue isWriter=true]
-        P2[SharedMemoryQueue isWriter=true]
-    end
-
-    subgraph "OS Shared Memory"
-        Q["Named Segment |header(28)|slot0|slot1|...|slotN|"]
-    end
-
-    subgraph "Process B..N (Consumers)"
-        C1[SharedMemoryQueue isWriter=false]
-        C2[SharedMemoryQueue isWriter=false]
-    end
-
-    P -- "enqueue()" --> Q
-    P2 -- "enqueue()" --> Q
-    Q -- "dequeue()" --> C1
-    Q -- "dequeue()" --> C2
-```
-
-### FFI: Cross-Language Interop
-
-```mermaid
-flowchart TB
-    subgraph "C++20 Header-Only Library"
-        LIB["libsharedmemory.hpp Memory - Stream - Queue"]
-    end
-
-    subgraph "C Wrapper"
-        CWRAP["lsm_c.h / lsm_c.cpp extern &quot;C&quot; functions"]
-    end
-
-    LIB --> CWRAP
-
-    CWRAP --> RUST["Rust (ffi/rust)"]
-    CWRAP --> ZIG["Zig (ffi/zig)"]
-    CWRAP --> GO["Go via cgo (ffi/go)"]
-    CWRAP --> C["Pure C lsm_c.h"]
-```
-
-### Platform Backends
-
-```mermaid
-flowchart TD
-    MEM["lsm::Memory"]
-
-    MEM -->|"POSIX (Linux, macOS)"| POSIX
-    MEM -->|"Win32"| WIN
-
-    subgraph POSIX ["Linux / macOS"]
-        P1["shm_open() + ftruncate()"]
-        P2["mmap(MAP_SHARED)"]
-        P3["shm_unlink()"]
-        P1 --> P2
-        P2 --> P3
-    end
-
-    subgraph WIN ["Windows"]
-        W1["CreateFileMappingA()"]
-        W2["MapViewOfFile()"]
-        W3["CloseHandle()"]
-        W1 --> W2
-        W2 --> W3
-        W1 -. "persist=true" .-> WF["File-backed\n%PROGRAMDATA%/shared_memory/"]
-    end
-```
-
-## Limits and Frequently Asked Questions
-
-### Can I use this for cross-platform network communication?
-
-No. **Endianness** is not handled. This is fine for local shared memory but requires attention if copying buffers to a network protocol.
-
-### What about cross compiler compatibility?
-
-**Cross-compiler** behavior for the binary memory layout is undefined. The library is designed for C++20 compliant compilers on the same platform. For cross-compiler or cross-language interoperability, you must ensure consistent data type sizes, alignment, and endianness.
-
-### Can I use this with multiple writers?
-
-**Yes!**, since v2.0.0! Stream writers are serialized with a shared lock and readers use coherent snapshots, so contention does not produce torn payloads in the current stress tests.
-
-### Are multiple producers supported for `SharedMemoryQueue`?
-
-**Yes!**, since v2.0.0! Queue producers are serialized with a shared producer lock and consumers with a shared consumer lock, preventing index/slot races under concurrent access.
-
-## License
-
-MIT - see [LICENSE](LICENSE).
+Producer and consumer normally live in separate processes. The example places
+them together only to show the public seam.
+
+## Backpressure and failure surface
+
+`SendOptions` selects:
+
+| Policy | Full queue behavior |
+| --- | --- |
+| `Block` | bounded active spin, then futex sleep until space, close, peer failure, or deadline |
+| `Timeout` | same bounded wait mechanics; deadline returns `Timeout` |
+| `Drop` | immediate `Dropped` without unbounded allocation |
+
+Other typed outcomes include `Closed`, `PeerUnavailable`, `PeerDead`,
+`StaleGeneration`, `RoleConflict`, `LayoutMismatch`,
+`MessageTooLarge`, `BufferTooSmall`, and `CorruptData`.
+
+## Evidence
+
+- [Benchmark methodology](docs/benchmark-methodology.md)
+- [Raw benchmark and full result table](BENCHMARK_RESULTS.md)
+- [Two perf experiments with raw stat/record/report evidence](benchmarks/profiling/README.md)
+- [Five-configuration test matrix and raw CTest logs](TEST_MATRIX.md)
+- [Fault matrix](docs/fault-matrix.md)
+- [Memory-order audit](docs/memory-model.md)
+- [Upstream audit](docs/upstream-analysis.md)
+- [Exact upstream-to-derivative boundary](UPSTREAM_DIFF.md)
+
+The benchmark report is revision-pinned. Results are not copied from upstream
+and are not generalized beyond their recorded WSL2 host and synchronous
+ping-pong protocol.
+
+## Upstream and Attribution
+
+Primary upstream:
+
+- [kyr0/libsharedmemory](https://github.com/kyr0/libsharedmemory)
+- pinned commit: `9e24caaefb28826e99a33be2dd1350725558dd80`
+- license: MIT
+- upstream copyright is preserved verbatim in [LICENSE](LICENSE)
+- original commits were imported with history, not squashed or redated
+
+What remains attributable to upstream:
+
+- the historical repository tree and development lineage;
+- the original MIT license and notices;
+- the initial small CMake/CTest scaffold and named-memory/fixed-capacity design
+  concepts used as the audit baseline.
+
+What FastIPC rewrote or newly implemented:
+
+- the compiled public API, layout, mapping lifecycle, queue algorithm,
+  synchronization, liveness/recovery, transport adapters, status model,
+  benchmark, fault tests, sanitizer matrix, profiling, and design and implementation documentation.
+
+Secondary repositories were design references only:
+
+- `vt-tv/lockfree_ipc_ringbuffer` for comparison with sequence/futex protocol
+  choices;
+- `rigtorp/ipc-bench` for benchmark taxonomy.
+
+No source from those secondary repositories is vendored into the compiled
+FastIPC core.
+
+The imported upstream examples, FFI bindings, old tests, changelog, screenshot,
+and single-header implementation remain in Git history and, where still
+present in this workspace tree, are historical artifacts only. They are not
+reachable from the current CMake build and their capabilities are not claimed
+as FastIPC features. Broad physical deletion was intentionally not performed
+without a separate destructive-file approval.
+
+See [UPSTREAM_DIFF.md](UPSTREAM_DIFF.md) for the exact retained/rewritten/new
+boundary.
+
+## Limitations
+
+- SPSC only; MPSC/MPMC requires a different reservation and recovery proof.
+- Payloads are copied into and out of fixed-size slots; there is no public
+  zero-copy loan lifetime.
+- Shared-memory peers must use the same Linux ABI and compatible FastIPC layout.
+- Heartbeats provide bounded suspicion, not a proof that a paused process is
+  permanently dead.
+- Recovery fences operations at API boundaries; a process frozen after its
+  final ownership check would need generation-tagged slots/cursors for strict
+  mid-operation fencing.
+- No authentication, encryption, namespace broker, SELinux policy integration,
+  NUMA placement, or real-time scheduling guarantee.
+- UDS sealed-memfd transfer is descriptor-assisted shared memory, not pure
+  socket-copy throughput.
+- WSL2 measurements must be repeated on native Linux and target hardware before
+  deployment decisions.

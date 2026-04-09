@@ -1,3 +1,10 @@
+# Upstream legacy changelog
+
+The entries below were imported from `kyr0/libsharedmemory` and describe the
+upstream baseline, not the compiled FastIPC derivative. Current FastIPC changes
+are recorded in Git history, [UPSTREAM_DIFF.md](UPSTREAM_DIFF.md), benchmark
+evidence, and the final project report.
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
