@@ -514,15 +514,54 @@ struct SharedMemoryTransport::Impl {
   bool role_claimed{false};
   bool unlink_on_owner_close{false};
   std::atomic<bool> closed{false};
+  bool close_complete{false};
   std::chrono::milliseconds peer_timeout{1000};
   std::uint32_t active_spin_count{0};
   std::uint64_t process_start_ticks{0};
   std::uint64_t role_token{0};
   std::atomic<std::uint64_t> observed_generation{0};
   std::atomic<std::uint64_t> next_peer_identity_probe_ns{0};
+  std::mutex operation_mutex;
+  std::condition_variable operation_cv;
+  std::size_t active_operations{0U};
   std::mutex heartbeat_mutex;
   std::condition_variable heartbeat_cv;
   std::jthread heartbeat_thread;
+
+  class OperationLease {
+   public:
+    explicit OperationLease(Impl& owner) : owner_(&owner) {
+      std::lock_guard lock(owner_->operation_mutex);
+      if (!owner_->closed.load(std::memory_order_relaxed)) {
+        ++owner_->active_operations;
+        acquired_ = true;
+      }
+    }
+
+    ~OperationLease() {
+      if (!acquired_) {
+        return;
+      }
+      bool notify = false;
+      {
+        std::lock_guard lock(owner_->operation_mutex);
+        --owner_->active_operations;
+        notify = owner_->active_operations == 0U;
+      }
+      if (notify) {
+        owner_->operation_cv.notify_all();
+      }
+    }
+
+    OperationLease(const OperationLease&) = delete;
+    OperationLease& operator=(const OperationLease&) = delete;
+
+    [[nodiscard]] bool acquired() const noexcept { return acquired_; }
+
+   private:
+    Impl* owner_;
+    bool acquired_{false};
+  };
 
   ~Impl() { Close(); }
 
@@ -573,8 +612,12 @@ struct SharedMemoryTransport::Impl {
   }
 
   void Close() noexcept {
-    if (closed.exchange(true, std::memory_order_acq_rel)) {
-      return;
+    {
+      std::unique_lock lock(operation_mutex);
+      if (closed.exchange(true, std::memory_order_acq_rel)) {
+        operation_cv.wait(lock, [this] { return close_complete; });
+        return;
+      }
     }
 
     heartbeat_thread.request_stop();
@@ -582,6 +625,19 @@ struct SharedMemoryTransport::Impl {
     if (heartbeat_thread.joinable()) {
       heartbeat_thread.join();
     }
+
+    if (layout != nullptr) {
+      AtomicFetchAdd(&layout->producer_cursor.data_epoch,
+                     std::uint32_t{1}, __ATOMIC_RELEASE);
+      AtomicFetchAdd(&layout->consumer_cursor.space_epoch,
+                     std::uint32_t{1}, __ATOMIC_RELEASE);
+      FutexWake(&layout->producer_cursor.data_epoch);
+      FutexWake(&layout->consumer_cursor.space_epoch);
+    }
+
+    std::unique_lock operation_lock(operation_mutex);
+    operation_cv.wait(
+        operation_lock, [this] { return active_operations == 0U; });
 
     bool may_unlink = owner && !role_claimed;
     if (layout != nullptr && role_claimed) {
@@ -612,6 +668,9 @@ struct SharedMemoryTransport::Impl {
     if (may_unlink && unlink_on_owner_close && !object_name.empty()) {
       ::shm_unlink(object_name.c_str());
     }
+    close_complete = true;
+    operation_lock.unlock();
+    operation_cv.notify_all();
   }
 };
 
@@ -939,7 +998,11 @@ SharedMemoryTransport::OpenConsumer(const ChannelConfig& config) {
 
 Status SharedMemoryTransport::Send(std::span<const std::byte> message,
                                    SendOptions options) {
-  if (!impl_ || impl_->closed.load(std::memory_order_acquire)) {
+  if (!impl_) {
+    return Status(StatusCode::Closed);
+  }
+  Impl::OperationLease operation(*impl_);
+  if (!operation.acquired()) {
     return Status(StatusCode::Closed);
   }
   if (impl_->role != Role::Producer) {
@@ -965,6 +1028,9 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
 
   std::uint64_t head = 0;
   for (;;) {
+    if (impl_->closed.load(std::memory_order_acquire)) {
+      return Status(StatusCode::Closed);
+    }
     head = AtomicLoad(&layout.producer_cursor.head, __ATOMIC_RELAXED);
     const auto tail =
         AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_ACQUIRE);
@@ -983,7 +1049,13 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
       return Status(StatusCode::Timeout);
     }
     if (SpinForSpace(layout, impl_->active_spin_count, &head)) {
+      if (impl_->closed.load(std::memory_order_acquire)) {
+        return Status(StatusCode::Closed);
+      }
       break;
+    }
+    if (impl_->closed.load(std::memory_order_acquire)) {
+      return Status(StatusCode::Closed);
     }
     if (options.deadline.expired()) {
       AtomicFetchAdd(&layout.producer_cursor.timeout_count,
@@ -1007,6 +1079,9 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
       continue;
     }
 
+    if (impl_->closed.load(std::memory_order_acquire)) {
+      return Status(StatusCode::Closed);
+    }
     const auto wait =
         FutexWait(&layout.consumer_cursor.space_epoch, expected_epoch,
                   ProbeDeadline(options.deadline, impl_->peer_timeout));
@@ -1019,6 +1094,9 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
     }
   }
 
+  if (impl_->closed.load(std::memory_order_acquire)) {
+    return Status(StatusCode::Closed);
+  }
   SlotHeader* slot = SlotAt(&layout, head);
   slot->length = static_cast<std::uint32_t>(message.size());
   slot->sequence = head + 1U;
@@ -1040,7 +1118,11 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
 
 Result<std::size_t> SharedMemoryTransport::Receive(
     std::span<std::byte> destination, Deadline deadline) {
-  if (!impl_ || impl_->closed.load(std::memory_order_acquire)) {
+  if (!impl_) {
+    return Status(StatusCode::Closed);
+  }
+  Impl::OperationLease operation(*impl_);
+  if (!operation.acquired()) {
     return Status(StatusCode::Closed);
   }
   if (impl_->role != Role::Consumer) {
@@ -1064,6 +1146,9 @@ Result<std::size_t> SharedMemoryTransport::Receive(
   }
   std::uint64_t tail = 0;
   for (;;) {
+    if (impl_->closed.load(std::memory_order_acquire)) {
+      return Status(StatusCode::Closed);
+    }
     tail = AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_RELAXED);
     const auto head =
         AtomicLoad(&layout.producer_cursor.head, __ATOMIC_ACQUIRE);
@@ -1076,7 +1161,13 @@ Result<std::size_t> SharedMemoryTransport::Receive(
       return Status(StatusCode::Timeout);
     }
     if (SpinForData(layout, impl_->active_spin_count, &tail)) {
+      if (impl_->closed.load(std::memory_order_acquire)) {
+        return Status(StatusCode::Closed);
+      }
       break;
+    }
+    if (impl_->closed.load(std::memory_order_acquire)) {
+      return Status(StatusCode::Closed);
     }
     if (deadline.expired()) {
       AtomicFetchAdd(&layout.consumer_cursor.timeout_count,
@@ -1100,6 +1191,9 @@ Result<std::size_t> SharedMemoryTransport::Receive(
       continue;
     }
 
+    if (impl_->closed.load(std::memory_order_acquire)) {
+      return Status(StatusCode::Closed);
+    }
     const auto wait =
         FutexWait(&layout.producer_cursor.data_epoch, expected_epoch,
                   ProbeDeadline(deadline, impl_->peer_timeout));
@@ -1112,6 +1206,9 @@ Result<std::size_t> SharedMemoryTransport::Receive(
     }
   }
 
+  if (impl_->closed.load(std::memory_order_acquire)) {
+    return Status(StatusCode::Closed);
+  }
   SlotHeader* slot = SlotAt(&layout, tail);
   const std::uint32_t length = slot->length;
   if (length > layout.queue.max_message_size) {
@@ -1143,8 +1240,11 @@ Result<std::size_t> SharedMemoryTransport::Receive(
 
 TransportStats SharedMemoryTransport::Stats() const noexcept {
   TransportStats stats;
-  if (!impl_ || impl_->closed.load(std::memory_order_acquire) ||
-      impl_->layout == nullptr) {
+  if (!impl_) {
+    return stats;
+  }
+  Impl::OperationLease operation(*impl_);
+  if (!operation.acquired() || impl_->layout == nullptr) {
     return stats;
   }
   const auto& layout = *impl_->layout;

@@ -559,6 +559,39 @@ int GracefulCloseWakesInfinitePeerWait() {
   return 0;
 }
 
+int LocalCloseWaitsForBlockedOperationBeforeUnmapping() {
+  using namespace std::chrono_literals;
+  using fastipc::Deadline;
+  using fastipc::SharedMemoryTransport;
+  using fastipc::StatusCode;
+
+  const auto config = ConfigFor("fastipc_local_close");
+  auto producer_result = SharedMemoryTransport::CreateProducer(config);
+  CHECK(producer_result.ok());
+  auto producer = std::move(producer_result).take_value();
+  auto consumer_result = SharedMemoryTransport::OpenConsumer(config);
+  CHECK(consumer_result.ok());
+  auto consumer = std::move(consumer_result).take_value();
+
+  std::atomic<int> observed_code{-1};
+  std::jthread waiting_consumer([&consumer, &observed_code] {
+    std::array<std::byte, 64> destination{};
+    const auto result =
+        consumer->Receive(destination, Deadline::Infinite());
+    observed_code.store(static_cast<int>(result.status().code()),
+                        std::memory_order_release);
+  });
+  std::this_thread::sleep_for(20ms);
+  consumer->Close();
+  waiting_consumer.join();
+
+  CHECK(observed_code.load(std::memory_order_acquire) ==
+        static_cast<int>(StatusCode::Closed));
+  CHECK(consumer->Stats().received_messages == 0U);
+  producer->Close();
+  return 0;
+}
+
 int StoppedProducerExpiresAndOldGenerationIsFenced() {
   using namespace std::chrono_literals;
   using fastipc::BackpressurePolicy;
@@ -1013,6 +1046,8 @@ constexpr std::array kTests{
     NamedTest{"producer_crash", KilledProducerIsDetectedAndReclaimed},
     NamedTest{"consumer_crash", KilledConsumerIsDetectedAndReclaimed},
     NamedTest{"graceful_close", GracefulCloseWakesInfinitePeerWait},
+    NamedTest{"local_close",
+              LocalCloseWaitsForBlockedOperationBeforeUnmapping},
     NamedTest{"stale_shared_memory",
               StoppedProducerExpiresAndOldGenerationIsFenced},
     NamedTest{"idle_heartbeat", IdleHeartbeatsPreventFalseTakeover},
