@@ -72,6 +72,7 @@ not performed without a separate destructive-file approval.
 | Memory ordering | Partial atomic use without cross-process audit | Per-field release/acquire proof and lock-free width assertions | `docs/memory-model.md` |
 | Waiting | Yield/spin or immediate false | Bounded active spin, epoch futex wait, predicate recheck and monotonic absolute deadlines | futex helpers, `Send`, `Receive` |
 | Backpressure | Immediate boolean failure | `Block`, deadline-bounded `Timeout`, immediate `Drop`, typed counters | `transport.hpp`, `Send` |
+| Shutdown lifetime | No public blocked-operation drain contract | `Close` marks closed, wakes both futex epochs, drains active operation leases, then releases role and mapping | `OperationLease`, `Impl::Close`, close regression test |
 | Lifecycle errors | Small enum plus exceptions | Typed setup and operation statuses, native errno where useful | `status.hpp`, `status.cpp` |
 | Repository front door | Upstream feature/readme and setup Makefile | Current capabilities, evidence links, safe build commands and limitations | `README.md`, `Makefile`, `SECURITY.md` |
 
@@ -81,6 +82,7 @@ not performed without a separate destructive-file approval.
 | --- | --- | --- |
 | Role ownership and fencing | PID plus Linux start ticks plus per-claim token; producer restart advances generation | `EndpointMetadata`, claim/open paths, `OwnsRole` |
 | Health and recovery | Dedicated heartbeat thread, amortized identity probes, peer-death statuses, reclaim under `flock` | heartbeat/liveness helpers and restart tests |
+| Operation lifetime fencing | Active-operation leases make concurrent `Close` wait until blocked calls observe closure; mapping release happens last | `shared_memory_transport.cpp`, `LocalCloseWaitsForBlockedOperationBeforeUnmapping` |
 | UDS transport | `AF_UNIX` `SOCK_SEQPACKET`; inline frames and sealed memfd plus `SCM_RIGHTS` for large payloads | `unix_domain_socket_transport.cpp` |
 | Hostile-input validation | Wire magic/version/flags/length validation and required memfd seals | UDS receive path and hostile-input tests |
 | Fault automation | Twelve named cross-process shared-memory fault cases plus UDS disconnect/corruption cases | `CMakeLists.txt`, `tests/` and `docs/fault-matrix.md` |
@@ -105,12 +107,14 @@ The derivative work is intentionally incremental. Important commits are:
 | `c5cb58a` | Cross-process benchmark harness |
 | `0efab39` through `866d32b` | Baseline profiling and two measured optimizations |
 | `8c542ca` | Five-configuration build/sanitizer verification |
+| `2bdd95f` | Active-operation lease and real crash/restart data-flow regression |
 
-At revision `8c542ca`, the reproducible command
-`git diff --stat e8d6d3c:projects/fastipc 8c542ca:projects/fastipc` reports 49
-changed files, 7,806 insertions and 161 deletions. That number is a review aid,
-not an authorship percentage: generated measurement records and documentation
-are included, while retained historical files are outside the diff.
+At tested revision `2bdd95f`, the reproducible command
+`git diff --shortstat e8d6d3c:projects/fastipc 2bdd95f:projects/fastipc`
+reports 55 changed files, 8,740 insertions and 635 deletions. That number is a
+review aid, not an authorship percentage: generated measurement records and
+documentation are included, while retained historical files are outside the
+diff.
 
 ## Secondary references
 

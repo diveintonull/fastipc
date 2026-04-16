@@ -1,0 +1,44 @@
+[OUTPUT] 
+Internal ctest changing into directory: /home/phil/job/new/projects/fastipc/build-verify-debug
+
+[HANDLER_OUTPUT] 
+Test project /home/phil/job/new/projects/fastipc/build-verify-debug
+
+      Start  1: fastipc.transport
+ 1/15 Test  #1: fastipc.transport ...................   Passed    1.37 sec
+      Start  2: fastipc.uds
+ 2/15 Test  #2: fastipc.uds .........................   Passed    0.09 sec
+      Start  3: fastipc.benchmark_smoke
+ 3/15 Test  #3: fastipc.benchmark_smoke .............   Passed    0.06 sec
+      Start  4: fastipc.fault.peer_missing
+ 4/15 Test  #4: fastipc.fault.peer_missing ..........   Passed    0.00 sec
+      Start  5: fastipc.fault.producer_crash
+ 5/15 Test  #5: fastipc.fault.producer_crash ........   Passed    0.00 sec
+      Start  6: fastipc.fault.consumer_crash
+ 6/15 Test  #6: fastipc.fault.consumer_crash ........   Passed    0.00 sec
+      Start  7: fastipc.fault.restart
+ 7/15 Test  #7: fastipc.fault.restart ...............   Passed    0.00 sec
+      Start  8: fastipc.fault.slow_consumer
+ 8/15 Test  #8: fastipc.fault.slow_consumer .........   Passed    0.02 sec
+      Start  9: fastipc.fault.timeout
+ 9/15 Test  #9: fastipc.fault.timeout ...............   Passed    0.03 sec
+      Start 10: fastipc.fault.malformed_header
+10/15 Test #10: fastipc.fault.malformed_header ......   Passed    0.00 sec
+      Start 11: fastipc.fault.version_mismatch
+11/15 Test #11: fastipc.fault.version_mismatch ......   Passed    0.00 sec
+      Start 12: fastipc.fault.stale_shared_memory
+12/15 Test #12: fastipc.fault.stale_shared_memory ...   Passed    0.30 sec
+      Start 13: fastipc.fault.queue_full
+13/15 Test #13: fastipc.fault.queue_full ............   Passed    0.03 sec
+      Start 14: fastipc.fault.queue_empty
+14/15 Test #14: fastipc.fault.queue_empty ...........   Passed    0.02 sec
+      Start 15: fastipc.fault.rapid_restart
+15/15 Test #15: fastipc.fault.rapid_restart .........   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 15
+
+Label Time Summary:
+benchmark    =   0.06 sec*proc (1 test)
+fault        =   0.42 sec*proc (12 tests)
+
+Total Test time (real) =   1.95 sec

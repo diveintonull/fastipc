@@ -5,7 +5,7 @@
 | Field | Value |
 | --- | --- |
 | Date | 2026-08-20 |
-| Revision | `a4233b0ae6d7` |
+| Revision | `2bdd95f00dbb95e129244a1651d0800e01ddd03b` |
 | Host | Ubuntu 24.04.4 under WSL2 |
 | Kernel | `6.6.87.2-microsoft-standard-WSL2` |
 | Architecture | x86_64 |
@@ -32,15 +32,16 @@ linker flags with `-fno-omit-frame-pointer`.
 
 | Configuration | Sanitizer options | Passed | Failed | Raw log |
 | --- | --- | ---: | ---: | --- |
-| Debug | none | 15 | 0 | [log](tests/results/2026-08-20-debug-a4233b0.log) |
-| Release | none | 15 | 0 | [log](tests/results/2026-08-20-release-a4233b0.log) |
-| ASan | `detect_leaks=1:halt_on_error=1` | 15 | 0 | [log](tests/results/2026-08-20-asan-a4233b0.log) |
-| UBSan | `halt_on_error=1:print_stacktrace=1` | 15 | 0 | [log](tests/results/2026-08-20-ubsan-a4233b0.log) |
-| TSan | `halt_on_error=1:second_deadlock_stack=1` | 15 | 0 | [log](tests/results/2026-08-20-tsan-a4233b0.log) |
+| Debug | none | 15 | 0 | [log](tests/results/2026-08-20-debug-2bdd95f.log) |
+| Release | none | 15 | 0 | [log](tests/results/2026-08-20-release-2bdd95f.log) |
+| ASan | `detect_leaks=1:halt_on_error=1` | 15 | 0 | [log](tests/results/2026-08-20-asan-2bdd95f.log) |
+| UBSan | `halt_on_error=1:print_stacktrace=1` | 15 | 0 | [log](tests/results/2026-08-20-ubsan-2bdd95f.log) |
+| TSan | `halt_on_error=1:second_deadlock_stack=1` | 15 | 0 | [log](tests/results/2026-08-20-tsan-2bdd95f.log) |
 
-The required matrix therefore executed 75/75 CTest entries successfully. An
-additional combined ASan+UBSan build also passed 15/15; it is supplementary and
-does not replace the separate ASan and UBSan rows.
+The required matrix therefore executed 75/75 CTest entries successfully.
+Debug, Release, ASan, UBSan, and TSan all include the operation-lifetime
+regression added after ASan exposed a receive-versus-unmap race in the
+AutoRuntime crash/restart integration test.
 
 On this WSL2 kernel, the TSan process tree was launched with:
 
@@ -58,7 +59,7 @@ host-specific wrapper.
 
 There are 15 registered CTest entries:
 
-- `fastipc.transport`: one composite executable containing 20 public-seam
+- `fastipc.transport`: one composite executable containing 21 public-seam
   shared-memory behavior cases;
 - `fastipc.uds`: one composite executable containing 13 Unix-domain-socket
   behavior and hostile-input cases;
@@ -82,9 +83,14 @@ The 12 automated fault entries are:
 12. Rapid Restart
 
 The separately addressable fault entries intentionally rerun a subset of the
-composite shared-memory executable. Therefore 15 CTest entries and 20
-internal shared-memory cases describe different layers and must not be added
+composite shared-memory executable. Therefore "15 CTest entries" and "21
+internal shared-memory cases" describe different layers and must not be added
 as if they were unique tests.
+
+The 21st shared-memory case, `local_close_waits_for_blocked_operation`, starts
+an infinite blocked receive, calls `Close()` from another thread, and verifies
+that the receive returns `Closed` before the mapping is released. It is the
+direct regression for commit `2bdd95f`.
 
 ## CI
 

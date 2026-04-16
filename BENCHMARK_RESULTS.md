@@ -23,7 +23,7 @@ measurement definitions and caveats are in
 There is one environment record and 18 result records: three transports at all
 six required payload sizes.
 
-## Shared memory  `spsc_ring_futex`
+## Shared memory - `spsc_ring_futex`
 
 | Payload | Iterations | Msg/s | MiB/s | P50 us | P95 us | P99 us | CPU % | Ctx V/I | RSS KiB P/C |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -49,7 +49,7 @@ than pure socket-copy throughput.
 | 64 KiB | 512 | 52,200.913 | 3,262.557 | 36.363 | 45.711 | 77.293 | 68.718 | 1,024 / 0 | 9,784 / 1,344 |
 | 1 MiB | 100 | 3,359.819 | 3,359.819 | 551.098 | 798.621 | 900.933 | 94.663 | 200 / 0 | 9,784 / 2,112 |
 
-## Pipe  `dual_nonblocking_pipe`
+## Pipe - `dual_nonblocking_pipe`
 
 | Payload | Iterations | Msg/s | MiB/s | P50 us | P95 us | P99 us | CPU % | Ctx V/I | RSS KiB P/C |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
