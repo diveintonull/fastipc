@@ -107,7 +107,7 @@ The clock samples included both benchmark timing and transport Send/Receive.
 
 ## Experiment hypotheses
 
-### Experiment 1  amortize process identity probes
+### Experiment 1 - amortize process identity probes
 
 The queue-empty/full path validated PID reuse by reopening and parsing
 `/proc/<pid>/stat` before every futex wait. That is correct but unnecessarily
@@ -119,7 +119,7 @@ bounded interval so an infinite caller deadline cannot hide a crash. This keeps
 PID-reuse fencing and bounded crash detection while removing filesystem and
 iostream work from most messages.
 
-### Experiment 2  remove redundant message-path heartbeat timestamps
+### Experiment 2 - remove redundant message-path heartbeat timestamps
 
 Each successful Send and Receive called `steady_clock::now` and wrote the
 heartbeat cache line even though a dedicated heartbeat thread already refreshes
@@ -130,7 +130,7 @@ Both changes must pass the full fault matrix and sanitizer matrix before their
 measurements count.
 
 
-## Experiment 1 result  identity-probe amortization plus bounded spin
+## Experiment 1 result - identity-probe amortization plus bounded spin
 
 Artifacts preserve both the first change and the evidence-driven correction:
 
@@ -180,7 +180,7 @@ active spin, 256 is the measured default, and values above 65,536 are rejected.
 The full Debug suite passed 15/15 before the implementation commits.
 
 
-## Experiment 2 result  heartbeat-thread timestamp ownership
+## Experiment 2 result - heartbeat-thread timestamp ownership
 
 Artifacts:
 
