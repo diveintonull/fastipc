@@ -1,171 +1,111 @@
-# FastIPC upstream analysis
+# FastIPC 上游分析
 
-## Scope and evidence
+## 范围与证据
 
-FastIPC starts from kyr0/libsharedmemory at commit
-9e24caaefb28826e99a33be2dd1350725558dd80. The upstream is a C++20,
-header-only shared-memory library with POSIX, Windows, and macOS paths. This
-audit describes the imported source before the FastIPC redesign. Exact
-provenance and the tree hash are recorded in the workspace UPSTREAMS.md.
+FastIPC 从 kyr0/libsharedmemory 的提交 `9e24caaefb28826e99a33be2dd1350725558dd80` 开始。上游是 C++20 header-only shared-memory library，含 POSIX、Windows、macOS path。本文审计 FastIPC redesign 前导入的源码；准确 provenance/tree hash 见工作区 [UPSTREAMS.md](../../../UPSTREAMS.md)。
 
-A clean Release/Ninja baseline of the pinned upstream completed its one CTest
-target. That proves only that the baseline builds and passes its own suite; it
-is not evidence for the new FastIPC requirements.
+固定上游的干净 Release/Ninja baseline 通过唯一 CTest target。这只证明 baseline 能构建并通过自己的 suite，不是新 FastIPC requirement 的证据。
 
-## Original architecture
+## 原始架构
 
-One public header combines platform mapping, stream-like last-value storage,
-and a queue. lsm::Memory owns a named mapping. Higher-level streams overlay
-flags, revision, acknowledgement, payload length, writer lock, and data on
-those bytes. lsm::SharedMemoryQueue overlays queue metadata and fixed-size
-slots on another mapping.
+一个 public header 同时包含 platform mapping、stream-like last-value storage 与 queue。`lsm::Memory` 拥有 named mapping；higher-level stream 在这些 byte 上叠加 flag、revision、acknowledgement、payload length、writer lock、data；`lsm::SharedMemoryQueue` 在另一 mapping 上叠加 queue metadata 与 fixed-size slot。
 
-There is no transport or protocol interface. Callers construct concrete stream
-or queue types with a shared-memory name, size, persistence flag, and role.
+没有 transport/protocol interface。caller 用 shared-memory name、size、persistence flag、role 构造 concrete stream/queue type。
 
 ## Shared-memory layout
 
-The upstream queue implements this host-native layout:
+上游 queue 的 host-native layout：
 
-    offset  size  field
-    0       4     writeIndex
-    4       4     readIndex
-    8       4     capacity
-    12      4     atomic count
-    16      4     maxMessageSize
-    20      4     atomic producerLock
-    24      4     atomic consumerLock
-    28      ...   capacity fixed-size slots
+```text
+offset  size  field
+0       4     writeIndex
+4       4     readIndex
+8       4     capacity
+12      4     atomic count
+16      4     maxMessageSize
+20      4     atomic producerLock
+24      4     atomic consumerLock
+28      ...   capacity fixed-size slots
 
-    slot := uint32 length + maxMessageSize bytes
+slot := uint32 length + maxMessageSize bytes
+```
 
-The writer computes the mapping size from constructor arguments, unlinks an
-existing POSIX object, creates a new object, and initializes the fields. A
-reader maps a size computed from its own arguments, then replaces its local
-capacity and maximum-message values with values from the mapping.
+writer 根据 constructor argument 计算 mapping size、unlink existing POSIX object、创建新 object、初始化 field。reader 按自己的 argument 计算 size 做 mapping，再用 mapping 内 value 覆盖本地 capacity/max-message。
 
-The layout has no magic, byte order, ABI-width marker, total-size field,
-version, initialization state, generation, endpoint identity, heartbeat, or
-checksum. The reader does not validate capacity, maximum message size, slot
-length, or whether the object is large enough for trusted metadata. An old or
-malformed segment can therefore be interpreted as a live queue.
+layout 没有 magic、byte order、ABI-width marker、total-size、version、initialization state、generation、endpoint identity、heartbeat、checksum。reader 不校验 capacity、max message size、slot length，也不确认 object 足够容纳 trusted metadata，因此 old/malformed segment 可能被解释为 live queue。
 
-## Queue structure and data flow
+## Queue structure 与数据流
 
-Enqueue acquires the producer spin lock, tests count, copies length and payload
-into the current slot, advances writeIndex, release-increments count, and
-releases the lock. Dequeue similarly acquires the consumer lock, tests count,
-copies into a std::string, advances readIndex, release-decrements count, and
-releases the lock. Peek takes the consumer lock without advancing.
+Enqueue 获取 producer spin lock、检查 count、把 length/payload copy 到 current slot、推进 writeIndex、release-increment count、释放 lock。Dequeue 对称地获取 consumer lock、检查 count、copy 到 `std::string`、推进 readIndex、release-decrement count、释放 lock。Peek 获取 consumer lock，但不推进。
 
-The design admits multiple producers or consumers by serializing each side,
-but attaches no owner identity to either lock. A process exiting while holding
-a lock leaves future peers spinning indefinitely.
+多个 producer/consumer 可在各自 side 串行执行，但 lock 不记录 owner identity。process 持 lock 退出会让未来 peer 永久 spin。
 
-## Synchronization and C++ object model
+## Synchronization 与 C++ object model
 
-The queue placement-constructs std::atomic<uint32_t> inside mapped bytes.
-Other processes recover references with reinterpret_cast. Side locks use
-acquire CAS, relaxed failure ordering, and release stores. Count uses acquire
-loads and release fetch-add/subtract. Indices and slots are ordinary bytes
-ordered indirectly by count and the side-specific locks.
+queue 在 mapped byte 内 placement-construct `std::atomic<uint32_t>`，其他 process 用 `reinterpret_cast` 恢复 reference。side lock 使用 acquire CAS、relaxed failure、release store；count 使用 acquire load 与 release fetch-add/subtract；index/slot 为 ordinary byte，间接由 count 和 side lock ordering。
 
-The intent is understandable, but upstream does not document cross-process C++
-object lifetime, audit lock-free requirements, or prove each happens-before
-edge. FastIPC will make SPSC head and tail the publication variables, isolate
-them by cache line, and document every ordering in docs/memory-model.md.
+设计意图可理解，但上游没有记录 cross-process C++ object lifetime、审计 lock-free requirement 或证明每条 happens-before edge。FastIPC 改用 SPSC head/tail publication、cache-line isolation，并在 `docs/memory-model.md` 记录每种 ordering。
 
-## Ownership and lifecycle
+## 所有权与生命周期
 
-Memory owns a file descriptor and mapping. On POSIX the creator unconditionally
-calls shm_unlink, creates mode 0777, calls fchmod before checking shm_open, then
-truncates and maps. Destruction unmaps/closes and optionally unlinks according
-to the persistence flag.
+`Memory` 拥有 fd 与 mapping。POSIX creator 无条件 `shm_unlink`，mode 0777 create，在检查 `shm_open` 前调用 `fchmod`，再 truncate/map。destruction 按 persistence flag unmap/close，可选 unlink。
 
-There is no atomic creator election or initialization handshake. Two creators
-can unlink and replace the name while existing peers retain an old object.
-Name ownership, mapping ownership, endpoint role, and generation are not
-separate concepts, so restart cannot be recognized reliably.
+没有 atomic creator election 或 initialization handshake。两个 creator 可 unlink/replace 同一 name，而 existing peer 仍指向 old object。name ownership、mapping ownership、endpoint role、generation 未分离，无法可靠识别 restart。
 
-## Blocking model and backpressure
+## Blocking model 与 backpressure
 
-Queue operations do not block: enqueue returns false when full and dequeue
-returns false when empty. Callers must wait themselves. Side locks busy-spin
-with yield. There is no futex, epoch, absolute deadline, timeout status,
-cancellation, or lost-wakeup protocol.
+queue operation 不阻塞：full 时 enqueue false，empty 时 dequeue false；caller 自己 wait。side lock 用 yield busy-spin。没有 futex、epoch、absolute deadline、timeout status、cancellation 或 lost-wakeup protocol。
 
-Memory is bounded, which is useful, but overflow has only implicit immediate
-failure. There are no Block, Timeout, or Drop policy objects and no counters
-that explain nondelivery.
+memory bounded 是有价值的 invariant，但 overflow 只有隐式 immediate failure。没有 Block/Timeout/Drop policy object，也没有解释 nondelivery 的 counter。
 
-## Failure handling
+## 故障处理
 
-Mapping calls return a small Error enum and higher layers mostly throw
-runtime_error. Upstream does not detect or repair:
+mapping call 返回小型 Error enum，higher layer 多数 throw `runtime_error`。上游不检测/修复：
 
-- incompatible or truncated layouts;
-- corrupt slot lengths;
-- duplicate producer or consumer ownership;
-- process death while holding a lock;
-- stale persistent segments;
-- peer restart or PID reuse;
-- stalled-but-alive peers;
-- close while another operation waits.
+- incompatible/truncated layout；
+- corrupt slot length；
+- duplicate producer/consumer ownership；
+- process 持 lock 死亡；
+- stale persistent segment；
+- peer restart/PID reuse；
+- stalled-but-alive peer；
+- 另一 operation wait 时 close。
 
-## API and performance characteristics
+## API 与性能特征
 
-The API is compact, but couples mapping, role, queue policy, payload, and
-lifecycle. Data is copied into and out of fixed-size slots. Both peers update a
-shared count, and all 28 metadata bytes share a cache line, causing avoidable
-coherence traffic. Yield-based locks spend CPU and scheduler resources under
-contention. Upstream records no latency percentiles, CPU, context switches, or
-resident memory, so this audit makes no performance claim.
+API 紧凑，却耦合 mapping、role、queue policy、payload、lifecycle。data copy 进出 fixed-size slot。双方共同更新 shared count，全部 28 B metadata 还共用一个 cache line，产生可避免 coherence traffic。yield lock 在 contention 下消耗 CPU/scheduler resource。上游没有 latency percentile、CPU、context switch、resident memory 记录，因此本审计不作性能声明。
 
-## Modification boundary
+## 修改边界
 
-### Keep
+### 保留
 
-- MIT license, notices, truthful upstream history, and attribution.
-- Small CMake/CTest scaffold and the Linux named-mapping RAII concept.
-- Fixed-capacity storage as a bounded-memory invariant.
-- Baseline tests only as compatibility evidence during migration.
+- MIT license、notice、真实上游历史、attribution。
+- 小型 CMake/CTest scaffold 与 Linux named-mapping RAII concept。
+- fixed-capacity storage 作为 bounded-memory invariant。
+- migration 期间只把 baseline test 当 compatibility evidence。
 
-### Rewrite
+### 重写
 
-- POSIX creation/opening, permissions, size checks, initialization election,
-  mapping ownership, and cleanup.
-- Byte layout as an explicitly versioned and validated Linux protocol.
-- Queue as cache-line-isolated SPSC head/tail publication with audited
-  acquire/release operations.
-- Errors as status/result values for timeout, peer death, layout mismatch, role
-  conflict, corruption, and shutdown.
-- Backpressure as explicit Block, Timeout, and Drop policies with metrics.
+- POSIX create/open、permission、size check、initialization election、mapping ownership、cleanup。
+- byte layout：改为显式 versioned/validated Linux protocol。
+- queue：改为 cache-line-isolated SPSC head/tail publication，并审计 acquire/release。
+- error：timeout、peer death、layout mismatch、role conflict、corruption、shutdown 使用 status/result。
+- backpressure：显式 Block/Timeout/Drop policy + metric。
 
-### Exclude from the compiled derivative
+### 不进入 compiled derivative
 
-- Windows/macOS implementations from the focused Linux core.
-- Legacy last-value streams and FFI surfaces that bypass the new lifecycle.
-- Process-shared spin locks and the shared count hot spot.
-- Implicit 0777 permissions and unlink-before-create behavior.
+- focused Linux core 之外的 Windows/macOS implementation。
+- 绕过新 lifecycle 的 legacy last-value stream 与 FFI。
+- process-shared spin lock 与 shared count hot spot。
+- 隐式 0777 permission 与 unlink-before-create。
 
-The current top-level CMake graph exposes only the new `FastIPC::fastipc`
-library, its tests, and its benchmark. Imported examples, FFI bindings, the
-single-header implementation, and old tests remain as historical files and in
-Git history, but no current target includes or links them. Physical deletion
-was not performed without separate authorization for that destructive scope.
-This quarantine preserves attribution without claiming legacy behavior as a
-FastIPC capability.
+当前 top-level CMake 只暴露新 `FastIPC::fastipc` library、test、benchmark。导入的 example、FFI、single-header implementation、old test 保留为历史文件，任何 current target 都不 include/link。未取得单独 destructive authorization，因此没有物理删除；这种 quarantine 既保留 attribution，也不把 legacy behavior 声称为 FastIPC capability。
 
-### Add
+### 新增
 
-- Magic, version, header/segment sizes, feature flags, generation, endpoint
-  metadata, PID/start identity, heartbeat, initialization state, and epochs.
-- Futex waits with monotonic absolute deadlines and recheck-before-sleep to
-  close the lost-wakeup window.
-- Duplicate-role rejection, stale detection, owner-death reporting, restart,
-  and generation-aware reconnection.
-- A Transport interface with shared-memory and Unix-domain-socket adapters;
-  pipe remains a benchmark-only baseline.
-- Unit, multiprocess, malformed-layout, fault-injection, and sanitizer tests.
-- Reproducible 64 B through 1 MiB benchmarks recording throughput, P50/P95/P99,
-  CPU, context switches, and memory, followed by measured profiling experiments.
+- magic、version、header/segment size、feature flag、generation、endpoint metadata、PID/start identity、heartbeat、initialization state、epoch；
+- 使用 monotonic absolute deadline 的 futex wait，以及 recheck-before-sleep 关闭 lost-wakeup window；
+- duplicate-role rejection、stale detection、owner-death reporting、restart、generation-aware reconnection；
+- 带 shared-memory 与 Unix Domain Socket adapter 的 Transport interface；pipe 只作 benchmark baseline；
+- unit、multiprocess、malformed-layout、fault-injection、sanitizer test；
+- 64 B–1 MiB 可复现 benchmark，记录 throughput、P50/P95/P99、CPU、context switch、memory，再进行 measured profiling experiment。

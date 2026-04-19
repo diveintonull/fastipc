@@ -1,22 +1,16 @@
-# Security policy
+# 安全策略
 
-FastIPC is an educational derivative project and currently has no
-production-supported release line or security-response SLA.
+FastIPC 是工程化衍生项目，目前没有生产支持的 release line 或 security-response SLA。
 
-Report suspected vulnerabilities through this repository's private GitHub
-Security Advisory / private vulnerability-reporting interface when available.
-If that interface is unavailable, contact the current repository owner through
-a private channel before disclosing exploit details publicly.
+发现疑似 vulnerability 时，如仓库支持，请通过 GitHub Security Advisory / private vulnerability-reporting interface 私下报告。若该接口不可用，请先通过私密渠道联系当前仓库 owner，再公开 exploit detail。
 
-Do not send FastIPC reports to the upstream `libsharedmemory` maintainer unless
-the issue is independently reproduced in unmodified upstream code. FastIPC's
-rewritten layout, transports, recovery logic, and API are maintained here.
+除非问题能在未修改上游代码中独立复现，否则不要把 FastIPC 报告发送给上游 `libsharedmemory` maintainer。FastIPC 重写后的 layout、transport、recovery logic 与 API 由本项目维护。
 
-Please include:
+报告请包含：
 
-- affected revision and Linux/kernel details;
-- transport and configuration;
-- minimal reproduction;
-- expected versus observed behavior;
-- sanitizer or crash output;
-- whether untrusted local users can reach the channel namespace.
+- 受影响 revision 与 Linux/kernel detail；
+- transport 与 configuration；
+- minimal reproduction；
+- expected/observed behavior；
+- sanitizer 或 crash output；
+- untrusted local user 是否能访问 channel namespace。

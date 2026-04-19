@@ -1,31 +1,27 @@
-# FastIPC fault matrix
+# FastIPC 故障矩阵
 
 ## Contract
 
-Every required fault is exposed as an independent CTest. Tests inject faults
-outside the public adapter only when corruption itself is the subject; all
-observations and recovery assertions use SharedMemoryTransport's public API.
+每种要求的故障都作为独立 CTest 暴露。只有 corruption 本身是测试主题时，才从 public adapter 外部注入；所有 observation 与 recovery assertion 都使用 SharedMemoryTransport public API。
 
-| Required scenario | Injection | Expected observable result | CTest |
+| 场景 | 注入方式 | 预期可观察结果 | CTest |
 | --- | --- | --- | --- |
-| Peer Missing | Open a consumer before the POSIX SHM object exists. | PeerUnavailable, preserving ENOENT as native detail. | fastipc.fault.peer_missing |
-| Producer Crash | Create producer in a child, SIGKILL it, then block the consumer. | PeerDead within the bounded liveness probe; replacement producer advances generation and restores flow. | fastipc.fault.producer_crash |
-| Consumer Crash | Create consumer in a child, SIGKILL it, fill the ring, then send again. | PeerDead; replacement consumer claims the role, drains committed messages, and restores flow. | fastipc.fault.consumer_crash |
-| Restart | Gracefully close a persistent producer and reclaim the same segment. | Generation increases and the existing consumer adopts it. | fastipc.fault.restart |
-| Slow Consumer | Fill a capacity-two ring and delay one receive. | Blocking producer sleeps, wakes on space_epoch, and completes without unbounded allocation. | fastipc.fault.slow_consumer |
-| Timeout | Receive from an empty live channel with one fixed deadline. | Timeout without deadline extension. | fastipc.fault.timeout |
-| Malformed Header | Change the mapped magic byte after closing a persistent producer. | LayoutMismatch from the public open operation. | fastipc.fault.malformed_header |
-| Version Mismatch | Replace the mapped major-version field with an unsupported value. | LayoutMismatch from exact 1.1 layout validation. | fastipc.fault.version_mismatch |
-| Stale Shared Memory | SIGSTOP a producer beyond its heartbeat lease and reclaim its role. | New generation succeeds; resumed old producer is fenced with StaleGeneration. | fastipc.fault.stale_shared_memory |
-| Queue Full | Fill the ring, then invoke Drop and finite Timeout policies. | Dropped and Timeout, with both counters incremented once. | fastipc.fault.queue_full |
-| Queue Empty | Block a consumer, publish later, and wake through data_epoch. | Receive completes with the exact payload and no lost wakeup. | fastipc.fault.queue_empty |
-| Rapid Restart | Reclaim the producer role 16 times while one consumer stays mapped. | Generation is strictly increasing and every iteration restores message flow. | fastipc.fault.rapid_restart |
+| Peer Missing | POSIX SHM object 存在前 open consumer | `PeerUnavailable`，native detail 保留 ENOENT | `fastipc.fault.peer_missing` |
+| Producer Crash | child 创建 producer，SIGKILL 后 consumer blocking | bounded liveness probe 内 `PeerDead`；replacement producer 推进 generation 并恢复流 | `fastipc.fault.producer_crash` |
+| Consumer Crash | child 创建 consumer，SIGKILL 后填满 ring 再 send | `PeerDead`；replacement consumer claim role、drain committed message、恢复流 | `fastipc.fault.consumer_crash` |
+| Restart | graceful close persistent producer，并 reclaim 同 segment | generation 增加，existing consumer adopt | `fastipc.fault.restart` |
+| Slow Consumer | 填满 capacity 2 ring，延迟一次 receive | blocking producer sleep，在 `space_epoch` wake，无 unbounded allocation | `fastipc.fault.slow_consumer` |
+| Timeout | live empty channel 上用固定 deadline Receive | `Timeout`，deadline 不延长 | `fastipc.fault.timeout` |
+| Malformed Header | persistent producer close 后修改 mapped magic | public open 返回 `LayoutMismatch` | `fastipc.fault.malformed_header` |
+| Version Mismatch | mapped major version 改为 unsupported | exact 1.1 validation 返回 `LayoutMismatch` | `fastipc.fault.version_mismatch` |
+| Stale Shared Memory | SIGSTOP producer 超过 heartbeat lease，再 reclaim role | 新 generation 成功；resume old producer 得 `StaleGeneration` | `fastipc.fault.stale_shared_memory` |
+| Queue Full | 填满 ring，调用 Drop 与 finite Timeout | `Dropped`、`Timeout`，两个 counter 各增一次 | `fastipc.fault.queue_full` |
+| Queue Empty | block consumer，稍后 publish，经 `data_epoch` wake | receive exact payload，无 lost wakeup | `fastipc.fault.queue_empty` |
+| Rapid Restart | consumer 保持 mapping，producer role 连续 reclaim 16 次 | generation 严格递增，每轮恢复消息流 | `fastipc.fault.rapid_restart` |
 
-Additional aggregate coverage includes duplicate producer, duplicate consumer,
-idle-heartbeat false-takeover prevention, stale-consumer role-token fencing,
-graceful-close wakeup, message exchange, and a 2,000-message epoch stress run.
+aggregate coverage 还包含 duplicate producer/consumer、idle-heartbeat false-takeover prevention、stale-consumer role-token fencing、graceful-close wakeup、message exchange 与 2,000-message epoch stress。
 
-## Reproduce
+## 复现
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
@@ -34,6 +30,4 @@ ctest --test-dir build --output-on-failure
 ctest --test-dir build -L fault --output-on-failure
 ```
 
-The fault label contains exactly the 12 scenarios required by the project
-specification. The unlabelled fastipc.transport test runs the broader aggregate
-suite in one process.
+fault label 恰好包含 specification 要求的 12 个 scenario。unlabelled `fastipc.transport` 在一个 process 中运行更广的 aggregate suite。

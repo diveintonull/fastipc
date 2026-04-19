@@ -1,136 +1,103 @@
-# FastIPC upstream-to-derivative boundary
+# FastIPC 上游与衍生实现边界
 
-## Purpose
+## 目的
 
-This document separates inherited history from current FastIPC engineering. It
-is an authorship and maintenance map, not a claim that every idea listed below
-is novel in the research sense.
+本文件区分 inherited history 与当前 FastIPC engineering。它是作者归属和维护地图，不声称下列每个 idea 在研究意义上都新颖。
 
-## Provenance and legal boundary
+## 来源与法律边界
 
-- Primary upstream: [kyr0/libsharedmemory](https://github.com/kyr0/libsharedmemory)
-- Pinned upstream commit: `9e24caaefb28826e99a33be2dd1350725558dd80`
-- Local subtree import commit: `e8d6d3c`
-- Imported tree: `b18d57de96feeaca5a9048c47e4ed99cb118edba`
-- License: MIT; the upstream copyright remains verbatim in `LICENSE`.
-- Additional retained notice: `test/lest.hpp` carries the Boost Software
-  License 1.0 and Martin Moene's notice.
+- Primary upstream：[kyr0/libsharedmemory](https://github.com/kyr0/libsharedmemory)
+- 固定上游提交：`9e24caaefb28826e99a33be2dd1350725558dd80`
+- 本地 subtree 导入提交：`fe161d2`
+- 导入 tree：`b18d57de96feeaca5a9048c47e4ed99cb118edba`
+- 许可证：MIT；上游版权原文保留于 `LICENSE`
+- 额外声明：`test/lest.hpp` 使用 Boost Software License 1.0，并保留 Martin Moene notice
 
-The upstream commits were imported as history, not squashed or redated. The
-workspace-level `UPSTREAMS.md` records both derivative projects and tag
-namespaces. No code from the two secondary FastIPC references was vendored.
+上游 commit 以完整历史导入，没有 squash 或修改日期。工作区 `UPSTREAMS.md` 记录两个衍生项目与 tag namespace。没有 vendor 两个 FastIPC secondary reference 的代码。
 
-## What the pinned upstream supplied
+## 固定上游提供的内容
 
-The imported baseline supplied a compact C++20 repository, a named-memory RAII
-concept, last-value streams, a fixed-capacity queue, examples and FFI bindings,
-one CTest target, CI and packaging scaffolding. Its compiled logic lived almost
-entirely in `include/libsharedmemory/libsharedmemory.hpp`.
+导入基线提供紧凑 C++20 仓库、named-memory RAII concept、last-value stream、fixed-capacity queue、example/FFI binding、一个 CTest target、CI/package scaffold。compiled logic 几乎全部位于 `include/libsharedmemory/libsharedmemory.hpp`。
 
-The upstream queue used host-native metadata, shared producer/consumer spin
-locks and a shared count. It had no protocol magic/version/total size,
-initialization election, endpoint identity, generation, heartbeat, futex wait,
-absolute deadline, typed transport seam, UDS adapter, fault matrix, percentile
-benchmark, sanitizer matrix or profiling evidence. The detailed baseline audit
-is in `docs/upstream-analysis.md`.
+上游 queue 使用 host-native metadata、共享 producer/consumer spin lock 与 shared count；没有 protocol magic/version/total size、initialization election、endpoint identity、generation、heartbeat、futex wait、absolute deadline、typed transport seam、UDS adapter、fault matrix、percentile benchmark、sanitizer matrix 或 profiling evidence。详见 `docs/upstream-analysis.md`。
 
-## Current build boundary
+## 当前构建边界
 
-`CMakeLists.txt` now exposes only:
+`CMakeLists.txt` 现在只暴露：
 
-- `FastIPC::fastipc`, built from `src/shared_memory_transport.cpp`,
-  `src/unix_domain_socket_transport.cpp`, and `src/status.cpp`;
-- the two current behavior/fault test executables;
-- the current cross-process benchmark executable.
+- `FastIPC::fastipc`，由 `src/shared_memory_transport.cpp`、`src/unix_domain_socket_transport.cpp`、`src/status.cpp` 构建；
+- 两个当前 behavior/fault test executable；
+- 当前 cross-process benchmark executable。
 
-The imported `include/libsharedmemory`, `example`, `ffi`, `test`,
-screenshot and legacy changelog remain physically present for historical
-inspection. They are not included or linked by the current build, and their
-features are not claimed as FastIPC behavior. Broad deletion was intentionally
-not performed without a separate destructive-file approval.
+导入的 `include/libsharedmemory`、`example`、`ffi`、`test`、screenshot、legacy changelog 仍保留用于历史审阅，不进入当前 build，也不算 FastIPC behavior。没有单独 destructive-file approval，因此未做广泛删除。
 
-## Keep, rewrite, add
+## Keep / Rewrite / Add
 
-### Kept with attribution
+### 保留并注明来源
 
-| Item | Current disposition | Evidence |
+| 项目 | 当前处理 | 证据 |
 | --- | --- | --- |
-| MIT license and copyright | Retained verbatim | `LICENSE` |
-| Full upstream development history | Retained through subtree import | `git log -- projects/fastipc`, import `e8d6d3c` |
-| Named-memory RAII and bounded-capacity concepts | Used as the audited starting point | `docs/upstream-analysis.md` |
-| Small CMake/CTest repository shape | Reworked into the current target graph | `CMakeLists.txt` |
-| Legacy source and examples | Historical only, excluded from build | current `CMakeLists.txt` |
+| MIT license 与 copyright | 原文保留 | `LICENSE` |
+| 完整上游 development history | 通过 subtree import 保留 | `git log -- projects/fastipc`、import `fe161d2` |
+| Named-memory RAII 与 bounded-capacity concept | 作为审计起点 | `docs/upstream-analysis.md` |
+| 小型 CMake/CTest 仓库结构 | 重做为当前 target graph | `CMakeLists.txt` |
+| Legacy source 与 example | 仅历史用途，不构建 | 当前 `CMakeLists.txt` |
 
-### Rewritten
+### 重写
 
-| Surface | Upstream | FastIPC | Evidence |
+| 层面 | 上游 | FastIPC | 证据 |
 | --- | --- | --- | --- |
-| Public API | Concrete stream/queue classes | Typed `Transport`, `Status`, `Result`, `Deadline`, and two adapters | `include/fastipc/` |
-| Mapping lifecycle | unlink-before-create and host-specific wrapper | Linux creator/open validation, mode 0600 default, size checks and initialization election | `src/shared_memory_transport.cpp`, creation/open sections |
-| Shared layout | Host-native fields without identity/version | Magic, 1.1 version, endian marker, byte sizes, generation, endpoints, epochs and isolated cursors | `src/shared_memory_layout.hpp` |
-| Queue algorithm | Lock-serialized sides plus shared count | SPSC single-writer head/tail publication without data-plane CAS | `Send` and `Receive` |
-| Memory ordering | Partial atomic use without cross-process audit | Per-field release/acquire proof and lock-free width assertions | `docs/memory-model.md` |
-| Waiting | Yield/spin or immediate false | Bounded active spin, epoch futex wait, predicate recheck and monotonic absolute deadlines | futex helpers, `Send`, `Receive` |
-| Backpressure | Immediate boolean failure | `Block`, deadline-bounded `Timeout`, immediate `Drop`, typed counters | `transport.hpp`, `Send` |
-| Shutdown lifetime | No public blocked-operation drain contract | `Close` marks closed, wakes both futex epochs, drains active operation leases, then releases role and mapping | `OperationLease`, `Impl::Close`, close regression test |
-| Lifecycle errors | Small enum plus exceptions | Typed setup and operation statuses, native errno where useful | `status.hpp`, `status.cpp` |
-| Repository front door | Upstream feature/readme and setup Makefile | Current capabilities, evidence links, safe build commands and limitations | `README.md`, `Makefile`, `SECURITY.md` |
+| Public API | concrete stream/queue class | typed `Transport`、`Status`、`Result`、`Deadline`、两种 adapter | `include/fastipc/` |
+| Mapping lifecycle | create 前 unlink 与 host-specific wrapper | Linux creator/open validation、mode 0600、size check、initialization election | `src/shared_memory_transport.cpp` |
+| Shared layout | 无 identity/version 的 host-native field | magic、1.1 version、endian marker、byte size、generation、endpoint、epoch、isolated cursor | `src/shared_memory_layout.hpp` |
+| Queue algorithm | lock-serialized side + shared count | 不含 data-plane CAS 的 SPSC single-writer head/tail publication | `Send`、`Receive` |
+| Memory ordering | 部分 atomic，未做 cross-process audit | per-field release/acquire proof 与 lock-free width assertion | `docs/memory-model.md` |
+| Waiting | yield/spin 或立即 false | bounded active spin、epoch futex wait、predicate recheck、monotonic absolute deadline | futex helper、`Send`、`Receive` |
+| Backpressure | 立即 boolean failure | `Block`、deadline-bounded `Timeout`、immediate `Drop`、typed counter | `transport.hpp`、`Send` |
+| Shutdown lifetime | 无 blocked-operation drain contract | `Close` 标记 closed、wake 两个 epoch、drain active operation lease，最后释放 role/mapping | `OperationLease`、`Impl::Close`、regression |
+| Lifecycle error | 小 enum + exception | typed setup/operation status，必要时附 native errno | `status.hpp`、`status.cpp` |
+| 仓库入口 | 上游 feature/readme 与 setup Makefile | 当前能力、证据、安全 build command、局限 | `README.md`、`Makefile`、`SECURITY.md` |
 
-### Added by the derivative work
+### 衍生项目新增
 
-| Capability | Design responsibility | Evidence |
+| 能力 | 设计职责 | 证据 |
 | --- | --- | --- |
-| Role ownership and fencing | PID plus Linux start ticks plus per-claim token; producer restart advances generation | `EndpointMetadata`, claim/open paths, `OwnsRole` |
-| Health and recovery | Dedicated heartbeat thread, amortized identity probes, peer-death statuses, reclaim under `flock` | heartbeat/liveness helpers and restart tests |
-| Operation lifetime fencing | Active-operation leases make concurrent `Close` wait until blocked calls observe closure; mapping release happens last | `shared_memory_transport.cpp`, `LocalCloseWaitsForBlockedOperationBeforeUnmapping` |
-| UDS transport | `AF_UNIX` `SOCK_SEQPACKET`; inline frames and sealed memfd plus `SCM_RIGHTS` for large payloads | `unix_domain_socket_transport.cpp` |
-| Hostile-input validation | Wire magic/version/flags/length validation and required memfd seals | UDS receive path and hostile-input tests |
-| Fault automation | Twelve named cross-process shared-memory fault cases plus UDS disconnect/corruption cases | `CMakeLists.txt`, `tests/` and `docs/fault-matrix.md` |
-| Benchmark | Shared memory, UDS and pipe; 64 B to 1 MiB; throughput, P50/P95/P99, CPU, context switches and memory | `benchmarks/`, `BENCHMARK_RESULTS.md` |
-| Performance engineering | Raw non-root perf evidence, rejected probe-only result, bounded-spin experiment and heartbeat ownership experiment | `benchmarks/profiling/` |
-| Verification matrix | Debug, Release, ASan, UBSan and TSan automation with revision-pinned raw logs | `.github/workflows/build_and_test.yml`, `TEST_MATRIX.md` |
-| Design and code evidence | Memory-model proof, module guides and code-anchored evidence | `docs/` |
+| Role ownership/fencing | PID + Linux start tick + per-claim token；producer restart 推进 generation | `EndpointMetadata`、claim/open path、`OwnsRole` |
+| Health/recovery | 专用 heartbeat thread、amortized identity probe、peer-death status、`flock` 下 reclaim | heartbeat/liveness helper、restart test |
+| Operation lifetime fencing | active-operation lease 使 concurrent `Close` 等待 blocked call 观察 closure；最后释放 mapping | `shared_memory_transport.cpp`、`LocalCloseWaitsForBlockedOperationBeforeUnmapping` |
+| UDS transport | `AF_UNIX` `SOCK_SEQPACKET`；inline frame 与 sealed memfd + `SCM_RIGHTS` | `unix_domain_socket_transport.cpp` |
+| Hostile-input validation | wire magic/version/flags/length 与 required memfd seal | UDS receive path、hostile-input test |
+| Fault automation | 12 个命名 cross-process shared-memory fault，加 UDS disconnect/corruption | `CMakeLists.txt`、`tests/`、`docs/fault-matrix.md` |
+| Benchmark | shared memory、UDS、pipe；64 B–1 MiB；throughput、P50/P95/P99、CPU、context switch、memory | `benchmarks/`、`BENCHMARK_RESULTS.md` |
+| Performance engineering | raw non-root perf evidence、rejected probe-only result、bounded-spin 与 heartbeat ownership experiment | `benchmarks/profiling/` |
+| Verification matrix | Debug/Release/ASan/UBSan/TSan automation 与固定 revision raw log | workflow、`TEST_MATRIX.md` |
+| 设计与代码证据 | memory-model proof、module guide、代码锚点 | `docs/` |
 
-## Commit-level evidence
+## Commit-level 证据
 
-The derivative work is intentionally incremental. Important commits are:
-
-| Commit | Boundary introduced |
+| Commit | 引入的边界 |
 | --- | --- |
-| `41882e3` | Versioned SPSC shared-memory transport and public seam |
-| `a547a64` | Futex epoch protocol and absolute deadlines |
-| `f32957c` | Generation-aware producer restart |
-| `ac63a80` | Role recovery after process death |
-| `485b05f` | Heartbeat leases and stale-role fencing |
-| `1d1d4cc` | Automated twelve-case FastIPC fault matrix |
-| `a5920c6` | Unix-domain-socket transport and large-message descriptor path |
-| `c5cb58a` | Cross-process benchmark harness |
-| `0efab39` through `866d32b` | Baseline profiling and two measured optimizations |
-| `8c542ca` | Five-configuration build/sanitizer verification |
-| `2bdd95f` | Active-operation lease and real crash/restart data-flow regression |
+| `b3b4ad5` | versioned SPSC shared-memory transport 与 public seam |
+| `6faca57` | futex epoch protocol 与 absolute deadline |
+| `ab7fcaa` | generation-aware producer restart |
+| `4a0f0be` | process death 后 role recovery |
+| `edc259d` | heartbeat lease 与 stale-role fencing |
+| `0bbdbce` | 自动化 12-case FastIPC fault matrix |
+| `6aadf80` | Unix Domain Socket transport 与 large-message descriptor path |
+| `2539fb1` | cross-process benchmark harness |
+| `f5aed21` 至 `c8c73d6` | baseline profiling 与两项 measured optimization |
+| `c7cac63` | 五配置 build/sanitizer verification |
+| `31b2107` | active-operation lease 与真实 crash/restart data-flow regression |
 
-At tested revision `2bdd95f`, the reproducible command
-`git diff --shortstat e8d6d3c:projects/fastipc 2bdd95f:projects/fastipc`
-reports 55 changed files, 8,740 insertions and 635 deletions. That number is a
-review aid, not an authorship percentage: generated measurement records and
-documentation are included, while retained historical files are outside the
-diff.
+在测试版本 `31b2107`，`git diff --shortstat fe161d2:projects/fastipc 31b2107:projects/fastipc` 报告 55 个文件变化、8,740 行新增、635 行删除。它只是评审辅助数据，不是作者占比：生成的测量记录和文档在差异内，保留历史文件在差异外。
 
-## Secondary references
+## 次要参考
 
-- `vt-tv/lockfree_ipc_ringbuffer` was used to compare layout validation,
-  sequence/futex choices and multiprocess test taxonomy.
-- `rigtorp/ipc-bench` was used to compare benchmark organization and transport
-  baselines.
+- `vt-tv/lockfree_ipc_ringbuffer`：比较 layout validation、sequence/futex choice、multiprocess test taxonomy。
+- `rigtorp/ipc-bench`：比较 benchmark organization 与 transport baseline。
 
-No source from either repository is present in the compiled core. If later work
-copies or adapts code rather than ideas or behavior, its exact license and
-attribution must be added before distribution.
+compiled core 没有两者源码。以后若真正 copy/adapt code，而非只参考 idea/behavior，分发前必须加入准确许可证与 attribution。
 
-## Deliberate non-claims
+## 明确不作的声明
 
-FastIPC does not claim MPSC/MPMC, portable ISO C++ process-shared atomics,
-public zero-copy loan ownership, authentication/encryption, hard real-time
-latency, crash-proof mid-instruction recovery, production security review, or
-native-hardware performance based on the recorded WSL2 results. These are
-explicit future design problems rather than implied capabilities.
+FastIPC 不声称 MPSC/MPMC、portable ISO C++ process-shared atomic、public zero-copy loan ownership、authentication/encryption、hard real-time latency、crash-proof mid-instruction recovery、production security review，也不把 WSL2 结果当成 native-hardware performance。这些是明确的未来设计问题，不是暗示存在的能力。

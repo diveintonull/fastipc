@@ -1,47 +1,35 @@
-# FastIPC benchmark methodology
+# FastIPC benchmark 方法
 
-## Purpose
+## 目的
 
-The benchmark compares the two FastIPC transports with a Linux pipe baseline
-under one reproducible cross-process protocol. It reports measurements; it does
-not claim that one transport is universally faster or suitable for every
-workload.
+benchmark 在一个可复现 cross-process protocol 下，比较两种 FastIPC transport 与 Linux pipe baseline。它报告 measurement，不声称某种 transport 在所有 workload 下都更快或都适用。
 
-## Required matrix
+## 必测矩阵
 
-Every recorded full run covers:
-
-| Transport | Mode |
+| Transport | 模式 |
 | --- | --- |
-| `shared_memory` | Two unidirectional SPSC rings with futex epoch wakeups |
-| `unix_domain_socket` | `SOCK_SEQPACKET`; inline data through 64 KiB, sealed `memfd` plus `SCM_RIGHTS` above 64 KiB |
-| `pipe` | Two nonblocking pipes, one per direction |
+| `shared_memory` | 两条单向 SPSC ring，使用 futex epoch wakeup |
+| `unix_domain_socket` | `SOCK_SEQPACKET`；64 KiB 内 inline，以上使用 sealed `memfd` + `SCM_RIGHTS` |
+| `pipe` | 两条 nonblocking pipe，每个方向一条 |
 
-Payload sizes are 64 B, 256 B, 1 KiB, 4 KiB, 64 KiB, and 1 MiB.
+payload：64 B、256 B、1 KiB、4 KiB、64 KiB、1 MiB。
 
 ## Protocol
 
-Each case forks exactly one child. The parent sends one payload and waits for
-the child to echo it before issuing the next payload. The first eight bytes
-carry a sequence number and the final payload is compared byte-for-byte.
+每个 case 恰好 fork 一个 child。parent 发送一条 payload，等待 child echo，再发下一条。前 8 B 是 sequence；最终 payload 做 byte-for-byte comparison。
 
-This is a single-outstanding ping-pong test:
+这是 single-outstanding ping-pong：
 
-1. It measures round-trip time (RTT), not one-way latency.
-2. It exercises process wakeup, transport send/receive, and echo work in both
-   directions.
-3. It does not measure a saturated multi-producer stream.
-4. Throughput is derived from completed RTTs. One RTT counts as two logical
-   messages and transfers two payloads.
+1. 测量 RTT，不是 one-way latency；
+2. 覆盖两个方向的 process wakeup、transport send/receive、echo；
+3. 不测 saturated multi-producer stream；
+4. throughput 从完成 RTT 推导；一个 RTT 算两条 logical message、传两份 payload。
 
-Shared memory uses separate request and reply channel objects because each ring
-is intentionally SPSC and unidirectional. The socket transport is full duplex.
-The pipe baseline uses one kernel pipe in each direction.
+shared memory 使用分离的 request/reply channel，因为每条 ring 都是 SPSC + unidirectional。socket 为 full duplex；pipe baseline 每方向一条 kernel pipe。
 
-## Iterations and warmup
+## Iteration 与 warmup
 
-The default measured iteration count targets approximately 64 MiB of total
-bidirectional payload:
+默认 measured iteration 目标约 64 MiB bidirectional payload：
 
 ```text
 iterations = clamp(
@@ -50,23 +38,17 @@ iterations = clamp(
     20,000)
 ```
 
-Warmup is excluded from every metric:
+warmup 不进入任何 metric：
 
 ```text
 warmup = clamp(iterations / 20, 5, 100)
 ```
 
-The command line can override both values. `--self-test` deliberately uses
-only three measured and one warmup iteration at 64 B and 1 MiB; it validates
-the harness and schema, not performance.
+command line 可覆盖二者。`--self-test` 在 64 B/1 MiB 只做 3 次 measured + 1 次 warmup，用于校验 harness/schema，不代表性能。
 
-## Timing and quantiles
+## Timing 与 quantile
 
-The parent records each RTT with `std::chrono::steady_clock`. P50, P95, and
-P99 are nearest-rank quantiles over measured iterations. Wall time surrounds
-only the measured parent loop.
-
-Reported rates are:
+parent 用 `std::chrono::steady_clock` 记录每个 RTT。P50/P95/P99 对 measured iteration 使用 nearest-rank。wall time 只包围 measured parent loop。
 
 ```text
 round_trips_per_second = iterations / wall_seconds
@@ -75,55 +57,40 @@ payload_mib_per_second = 2 * iterations * payload_bytes
                          / (MiB * wall_seconds)
 ```
 
-## CPU, context switches, and memory
+## CPU、context switch、memory
 
-Parent and child call `getrusage(RUSAGE_SELF)` immediately before and after
-their measured loops. The runner sums their deltas for:
+parent/child 在 measured loop 前后调用 `getrusage(RUSAGE_SELF)`，runner 汇总 delta：
 
-- user CPU time;
-- system CPU time;
-- voluntary context switches;
-- involuntary context switches.
+- user CPU time；
+- system CPU time；
+- voluntary context switch；
+- involuntary context switch。
 
-CPU utilization is summed CPU time divided by parent wall time. It can exceed
-100 percent because two processes can run concurrently.
+CPU utilization = summed CPU time / parent wall time；两个 process 并行时可超过 100%。
 
-`parent_peak_rss_kib` and `child_peak_rss_kib` are Linux `ru_maxrss`
-values. They are process-lifetime peaks, not measured-window deltas, and include
-the runner, allocator, and transport setup. They are useful as coarse memory
-signals, not precise per-message allocation counts.
+`parent_peak_rss_kib` 与 `child_peak_rss_kib` 是 Linux `ru_maxrss`，为 process-lifetime peak，不是 measured-window delta；它还包含 runner、allocator、transport setup。只能当 coarse memory signal，不能视为 precise per-message allocation。
 
-## UDS large-message interpretation
+## UDS 大消息解释
 
-Messages at or below 64 KiB are sent inline in one `SOCK_SEQPACKET` record.
-Larger messages, including the 1 MiB case, are copied into a sealed anonymous
-`memfd`; the descriptor is transferred with `SCM_RIGHTS`, and the receiver
-validates type, exact size, and required seals before mapping it.
+不超过 64 KiB 的 message 在一个 `SOCK_SEQPACKET` record 内 inline 发送。更大 message（含 1 MiB case）复制到 sealed anonymous `memfd`；通过 `SCM_RIGHTS` 传 descriptor；receiver 校验 type、exact size、required seal 后 mapping。
 
-Results label these paths `seqpacket_inline` and
-`seqpacket_sealed_memfd`. The latter is descriptor-assisted shared memory and
-must not be described as pure socket-copy throughput.
+结果分别标记 `seqpacket_inline` 与 `seqpacket_sealed_memfd`。后者是 descriptor-assisted shared memory，不能表述为 pure socket-copy throughput。
 
 ## Environment record
 
-The first JSONL record captures UTC time, hostname, kernel, architecture, CPU
-model, online logical CPU count, page size, total memory, compiler, build type,
-and the source revision embedded at CMake configure time. Each following line
-is one result record.
+第一条 JSONL 记录 UTC、hostname、kernel、architecture、CPU model、online logical CPU count、page size、total memory、compiler、build type，以及 CMake configure 时嵌入的 source revision；之后每行是一条 result。
 
-For comparable evidence:
+为了得到可比较证据：
 
-1. configure and build Release after the benchmark commit exists, so the
-   embedded revision names the measured source;
-2. run the full matrix from an otherwise idle machine;
-3. preserve raw JSONL rather than copying terminal summaries;
-4. repeat runs when drawing performance conclusions;
-5. record virtualization, power-management, and CPU-affinity conditions.
+1. benchmark commit 存在后再配置 Release build，让 embedded revision 准确；
+2. 在尽量 idle 的机器运行 full matrix；
+3. 保存 raw JSONL，不只复制 terminal summary；
+4. 做性能结论时重复 run；
+5. 记录 virtualization、power management、CPU affinity 条件。
 
-WSL2 results demonstrate behavior on that recorded host. They are not a
-substitute for native Linux and target-hardware measurements.
+WSL2 结果只证明所记录 host 的行为，不替代 native Linux/target hardware。
 
-## Commands
+## 命令
 
 ```bash
 cmake -S projects/fastipc -B projects/fastipc/build-release \
@@ -133,5 +100,4 @@ cmake --build projects/fastipc/build-release --target fastipc_benchmark
 projects/fastipc/build-release/fastipc_benchmark
 ```
 
-Use `--help` for transport, payload, iteration, and warmup filters. Standard
-output is JSONL; diagnostics and typed failures go to standard error.
+用 `--help` 查看 transport、payload、iteration、warmup filter。stdout 为 JSONL；diagnostic 与 typed failure 输出到 stderr。

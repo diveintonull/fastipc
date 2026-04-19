@@ -1,20 +1,20 @@
-# FastIPC test matrix
+# FastIPC 测试矩阵
 
-## Verified snapshot
+提交身份改写导致当前提交 ID 与原始日志文件名中的旧 ID 不同；对照见 [提交身份改写映射](../../COMMIT_IDENTITY_MAP.md)。原始日志未改写。
+## 已验证快照
 
-| Field | Value |
+| 字段 | 值 |
 | --- | --- |
-| Date | 2026-08-20 |
-| Revision | `2bdd95f00dbb95e129244a1651d0800e01ddd03b` |
-| Host | Ubuntu 24.04.4 under WSL2 |
+| 日期 | 2026-08-20 |
+| Revision | `31b21074189146447e617003330006803bbb27c14` |
+| Host | WSL2 下 Ubuntu 24.04.4 |
 | Kernel | `6.6.87.2-microsoft-standard-WSL2` |
 | Architecture | x86_64 |
 | Compiler | GNU 13.3.0 |
 | Generator | Ninja 1.11.1 |
 | CMake | 3.28.3 |
 
-Every configuration was created in a new build directory, compiled from this
-revision, and run with:
+每种配置都使用全新 build directory，从该 revision 编译并执行：
 
 ```bash
 cmake -S projects/fastipc -B BUILD -G Ninja \
@@ -25,25 +25,21 @@ cmake --build BUILD --parallel 2
 ctest --test-dir BUILD --output-on-failure
 ```
 
-Sanitizer configurations additionally passed matching compiler and executable
-linker flags with `-fno-omit-frame-pointer`.
+sanitizer 配置还为 compiler 与 executable linker 传入匹配 flag，并使用 `-fno-omit-frame-pointer`。
 
-## Results
+## 结果
 
-| Configuration | Sanitizer options | Passed | Failed | Raw log |
+| 配置 | Sanitizer option | 通过 | 失败 | 原始日志 |
 | --- | --- | ---: | ---: | --- |
-| Debug | none | 15 | 0 | [log](tests/results/2026-08-20-debug-2bdd95f.log) |
-| Release | none | 15 | 0 | [log](tests/results/2026-08-20-release-2bdd95f.log) |
-| ASan | `detect_leaks=1:halt_on_error=1` | 15 | 0 | [log](tests/results/2026-08-20-asan-2bdd95f.log) |
-| UBSan | `halt_on_error=1:print_stacktrace=1` | 15 | 0 | [log](tests/results/2026-08-20-ubsan-2bdd95f.log) |
-| TSan | `halt_on_error=1:second_deadlock_stack=1` | 15 | 0 | [log](tests/results/2026-08-20-tsan-2bdd95f.log) |
+| Debug | 无 | 15 | 0 | [日志](tests/results/2026-08-20-debug-2bdd95f.log) |
+| Release | 无 | 15 | 0 | [日志](tests/results/2026-08-20-release-2bdd95f.log) |
+| ASan | `detect_leaks=1:halt_on_error=1` | 15 | 0 | [日志](tests/results/2026-08-20-asan-2bdd95f.log) |
+| UBSan | `halt_on_error=1:print_stacktrace=1` | 15 | 0 | [日志](tests/results/2026-08-20-ubsan-2bdd95f.log) |
+| TSan | `halt_on_error=1:second_deadlock_stack=1` | 15 | 0 | [日志](tests/results/2026-08-20-tsan-2bdd95f.log) |
 
-The required matrix therefore executed 75/75 CTest entries successfully.
-Debug, Release, ASan, UBSan, and TSan all include the operation-lifetime
-regression added after ASan exposed a receive-versus-unmap race in the
-AutoRuntime crash/restart integration test.
+完整矩阵共执行 75/75 个 CTest entry。Debug、Release、ASan、UBSan、TSan 均包含 operation-lifetime regression；该 regression 源于 AutoRuntime crash/restart integration test 在 ASan 下发现的 receive-versus-unmap race。
 
-On this WSL2 kernel, the TSan process tree was launched with:
+该 WSL2 kernel 下，TSan process tree 使用：
 
 ```bash
 setarch x86_64 -R env \
@@ -51,23 +47,18 @@ setarch x86_64 -R env \
   ctest --test-dir BUILD --output-on-failure
 ```
 
-Disabling address randomization for the TSan process avoids WSL shadow-memory
-mapping collisions. Native Linux CI runs the same TSan binary without this
-host-specific wrapper.
+对 TSan process 禁用 address randomization，可避开 WSL shadow-memory mapping collision。native Linux CI 不用 host-specific wrapper，直接运行同一 TSan binary。
 
-## CTest inventory
+## CTest 清单
 
-There are 15 registered CTest entries:
+共有 15 个 registered CTest entry：
 
-- `fastipc.transport`: one composite executable containing 21 public-seam
-  shared-memory behavior cases;
-- `fastipc.uds`: one composite executable containing 13 Unix-domain-socket
-  behavior and hostile-input cases;
-- `fastipc.benchmark_smoke`: six short cases covering three transports at
-  64 B and 1 MiB, plus JSONL schema assertions;
-- 12 separately addressable fault entries.
+- `fastipc.transport`：一个 composite executable，包含 21 个 public-seam shared-memory behavior case；
+- `fastipc.uds`：一个 composite executable，包含 13 个 Unix Domain Socket behavior/hostile-input case；
+- `fastipc.benchmark_smoke`：六个短 case，覆盖三种 transport 的 64 B 与 1 MiB，并检查 JSONL schema；
+- 12 个可单独寻址的 fault entry。
 
-The 12 automated fault entries are:
+12 个自动化 fault entry：
 
 1. Peer Missing
 2. Producer Crash
@@ -82,19 +73,10 @@ The 12 automated fault entries are:
 11. Queue Empty
 12. Rapid Restart
 
-The separately addressable fault entries intentionally rerun a subset of the
-composite shared-memory executable. Therefore "15 CTest entries" and "21
-internal shared-memory cases" describe different layers and must not be added
-as if they were unique tests.
+单独 fault entry 有意重跑 composite shared-memory executable 的子集。因此“15 个 CTest entry”与“21 个内部 shared-memory case”属于不同层级，不能当作独立测试相加。
 
-The 21st shared-memory case, `local_close_waits_for_blocked_operation`, starts
-an infinite blocked receive, calls `Close()` from another thread, and verifies
-that the receive returns `Closed` before the mapping is released. It is the
-direct regression for commit `2bdd95f`.
+第 21 个 shared-memory case `local_close_waits_for_blocked_operation` 会启动无限 blocked receive，从另一线程调用 `Close()`，验证 receive 在 mapping 释放前返回 `Closed`。它是 commit `31b2107` 的直接 regression。
 
 ## CI
 
-[build_and_test.yml](.github/workflows/build_and_test.yml) replaces the inherited
-upstream release/multi-platform workflow, which referenced removed
-`libsharedmemory` targets. The derivative project is Linux-specific and now
-runs Debug, Release, ASan, UBSan, and TSan as five independent Ubuntu jobs.
+[build_and_test.yml](.github/workflows/build_and_test.yml) 替代继承的上游 release/multi-platform workflow；后者引用了已移除的 `libsharedmemory` target。衍生项目只支持 Linux，当前以五个独立 Ubuntu job 运行 Debug、Release、ASan、UBSan、TSan。

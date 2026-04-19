@@ -1,38 +1,24 @@
 # FastIPC
 
-FastIPC is a Linux C++20 IPC library built as a deep, attributed derivative of
-`kyr0/libsharedmemory`. The current core provides a versioned SPSC
-shared-memory channel, futex blocking with absolute deadlines, peer
-liveness/restart fencing, explicit backpressure, and a common transport seam
-implemented by shared memory and Unix domain sockets.
+FastIPC 是 Linux C++20 IPC library，基于 `kyr0/libsharedmemory` 深度派生并明确标注来源。当前 core 提供 versioned SPSC shared-memory channel、带 absolute deadline 的 futex blocking、peer liveness/restart fencing、显式 backpressure，以及由 shared memory 与 Unix Domain Socket 实现的统一 transport seam。
 
-This project has not undergone a production security review and is not a
-replacement for iceoryx, eCAL, or a security-reviewed IPC stack.
 
-## Capabilities
+## 能力
 
-- Linux POSIX shared-memory mapping with creator/open validation and mode 0600
-  defaults;
-- versioned, endian-marked layout with total size, initialization state, and
-  generation;
-- cache-line-isolated SPSC head/tail cursors and fixed-capacity slots;
-- audited acquire/release publication without `memory_order_seq_cst`;
-- futex epochs, recheck-before-sleep, monotonic absolute deadlines, and bounded
-  active spin;
-- PID, Linux process-start ticks, role token, heartbeat lease, and generation
-  fencing;
-- producer/consumer crash detection, stale segment recovery, and restart flow;
-- Block, Timeout, and Drop backpressure with typed `Status` values and
-  counters;
-- `Transport` API with `SharedMemoryTransport` and
-  `UnixDomainSocketTransport`;
-- UDS `SOCK_SEQPACKET` inline frames through 64 KiB and sealed-memfd
-  descriptor transfer for larger payloads;
-- cross-process benchmark matrix for 64 B through 1 MiB, with pipe as a third
-  baseline;
-- automated Debug, Release, ASan, UBSan, and TSan coverage.
+- Linux POSIX shared-memory mapping，带 creator/open validation，默认 mode 0600；
+- versioned、endian-marked layout，包含 total size、initialization state、generation；
+- cache-line 隔离的 SPSC head/tail cursor 与 fixed-capacity slot；
+- 经审计的 acquire/release publication，不依赖 `memory_order_seq_cst`；
+- futex epoch、sleep 前 recheck、monotonic absolute deadline、bounded active spin；
+- PID、Linux process-start tick、role token、heartbeat lease、generation fencing；
+- producer/consumer crash detection、stale segment recovery、restart flow；
+- Block、Timeout、Drop backpressure，返回 typed `Status` 与 counter；
+- `Transport` API，包含 `SharedMemoryTransport`、`UnixDomainSocketTransport`；
+- UDS `SOCK_SEQPACKET`：64 KiB 内 inline frame；更大 payload 使用 sealed-memfd descriptor transfer；
+- 64 B 至 1 MiB 的 cross-process benchmark matrix，并用 pipe 作为第三 baseline；
+- 自动 Debug、Release、ASan、UBSan、TSan 覆盖。
 
-## Architecture
+## 架构
 
 ```text
 Application
@@ -51,19 +37,16 @@ Transport { Send, Receive, Stats, Close }
            +-- inline frame or sealed memfd + SCM_RIGHTS
 ```
 
-Shared memory uses two ownership planes:
+shared memory 分为两条 ownership plane：
 
-- data plane: one producer owns `head` and slot writes; one consumer owns
-  `tail` and slot reads;
-- control plane: role claims, generation, PID/start-ticks identity, heartbeat,
-  and cleanup.
+- data plane：一个 producer 独占 `head` 与 slot write；一个 consumer 独占 `tail` 与 slot read；
+- control plane：role claim、generation、PID/start-ticks identity、heartbeat、cleanup。
 
-The heartbeat jthread exclusively refreshes the lease timestamp. Successful
-message operations increment an independent progress sequence.
+heartbeat `jthread` 是 lease timestamp 的唯一 writer；成功 message operation 只增加独立 progress sequence。
 
-## Build and test
+## 构建与测试
 
-From this directory:
+在本目录执行：
 
 ```bash
 cmake -S . -B build -G Ninja \
@@ -74,14 +57,14 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The default build produces:
+默认 build 生成：
 
-- `FastIPC::fastipc`, the static library target;
-- `fastipc_tests`, the shared-memory behavior/fault executable;
-- `fastipc_uds_tests`, the Unix-socket behavior/hostile-input executable;
-- `fastipc_benchmark`, the JSONL benchmark runner.
+- `FastIPC::fastipc`：static library target；
+- `fastipc_tests`：shared-memory behavior/fault executable；
+- `fastipc_uds_tests`：Unix-socket behavior/hostile-input executable；
+- `fastipc_benchmark`：JSONL benchmark runner。
 
-## Shared-memory example
+## Shared-memory 示例
 
 ```cpp
 #include <fastipc/shared_memory_transport.hpp>
@@ -123,94 +106,71 @@ auto received =
     consumer->Receive(destination, fastipc::Deadline::After(100ms));
 ```
 
-Producer and consumer normally live in separate processes. The example places
-them together only to show the public seam.
+producer 与 consumer 通常位于不同 process；这里放在一起仅为展示 public seam。
 
-## Backpressure and failure surface
+## Backpressure 与 failure surface
 
-`SendOptions` selects:
+`SendOptions` policy：
 
-| Policy | Full queue behavior |
+| Policy | queue 满时行为 |
 | --- | --- |
-| `Block` | bounded active spin, then futex sleep until space, close, peer failure, or deadline |
-| `Timeout` | same bounded wait mechanics; deadline returns `Timeout` |
-| `Drop` | immediate `Dropped` without unbounded allocation |
+| `Block` | bounded active spin，随后 futex sleep，直至有空间、close、peer failure 或 deadline |
+| `Timeout` | 使用相同 bounded wait；到 deadline 返回 `Timeout` |
+| `Drop` | 立即返回 `Dropped`，不做 unbounded allocation |
 
-Other typed outcomes include `Closed`, `PeerUnavailable`, `PeerDead`,
-`StaleGeneration`, `RoleConflict`, `LayoutMismatch`,
-`MessageTooLarge`, `BufferTooSmall`, and `CorruptData`.
+其他 typed outcome：`Closed`、`PeerUnavailable`、`PeerDead`、`StaleGeneration`、`RoleConflict`、`LayoutMismatch`、`MessageTooLarge`、`BufferTooSmall`、`CorruptData`。
 
-## Evidence
+## 证据
 
-- [Benchmark methodology](docs/benchmark-methodology.md)
-- [Raw benchmark and full result table](BENCHMARK_RESULTS.md)
-- [Two perf experiments with raw stat/record/report evidence](benchmarks/profiling/README.md)
-- [Five-configuration test matrix and raw CTest logs](TEST_MATRIX.md)
-- [Fault matrix](docs/fault-matrix.md)
-- [Memory-order audit](docs/memory-model.md)
-- [Upstream audit](docs/upstream-analysis.md)
-- [Exact upstream-to-derivative boundary](UPSTREAM_DIFF.md)
+- [Benchmark 方法](docs/benchmark-methodology.md)
+- [原始 benchmark 与完整结果](BENCHMARK_RESULTS.md)
+- [两轮 perf 实验与原始 stat/record/report](benchmarks/profiling/README.md)
+- [五种配置测试矩阵与原始 CTest 日志](TEST_MATRIX.md)
+- [故障矩阵](docs/fault-matrix.md)
+- [内存序审计](docs/memory-model.md)
+- [上游审计](docs/upstream-analysis.md)
+- [准确的上游/衍生边界](UPSTREAM_DIFF.md)
 
-The benchmark report is revision-pinned. Results are not copied from upstream
-and are not generalized beyond their recorded WSL2 host and synchronous
-ping-pong protocol.
+benchmark report 固定到明确 revision；结果不是从上游复制，也不能推广到所记录 WSL2 host 与 synchronous ping-pong protocol 之外。
 
-## Upstream and Attribution
+## 上游与归属
 
-Primary upstream:
+Primary upstream：
 
 - [kyr0/libsharedmemory](https://github.com/kyr0/libsharedmemory)
-- pinned commit: `9e24caaefb28826e99a33be2dd1350725558dd80`
-- license: MIT
-- upstream copyright is preserved verbatim in [LICENSE](LICENSE)
-- original commits were imported with history, not squashed or redated
+- 固定提交：`9e24caaefb28826e99a33be2dd1350725558dd80`
+- 许可证：MIT
+- 上游版权原文保留于 [LICENSE](LICENSE)
+- original commit 连历史导入，没有 squash 或修改日期
 
-What remains attributable to upstream:
+仍归属上游的部分：
 
-- the historical repository tree and development lineage;
-- the original MIT license and notices;
-- the initial small CMake/CTest scaffold and named-memory/fixed-capacity design
-  concepts used as the audit baseline.
+- 历史 repository tree 与 development lineage；
+- original MIT license 与 notice；
+- 用作审计 baseline 的小型 CMake/CTest scaffold，以及 named-memory/fixed-capacity design concept。
 
-What FastIPC rewrote or newly implemented:
+FastIPC 重写或新实现的部分：
 
-- the compiled public API, layout, mapping lifecycle, queue algorithm,
-  synchronization, liveness/recovery, transport adapters, status model,
-  benchmark, fault tests, sanitizer matrix, profiling, and design and implementation documentation.
+- compiled public API、layout、mapping lifecycle、queue algorithm、synchronization、liveness/recovery、transport adapter、status model、benchmark、fault test、sanitizer matrix、profiling 与设计/实现文档。
 
-Secondary repositories were design references only:
+secondary repository 只作设计参考：
 
-- `vt-tv/lockfree_ipc_ringbuffer` for comparison with sequence/futex protocol
-  choices;
-- `rigtorp/ipc-bench` for benchmark taxonomy.
+- `vt-tv/lockfree_ipc_ringbuffer`：比较 sequence/futex protocol；
+- `rigtorp/ipc-bench`：比较 benchmark taxonomy。
 
-No source from those secondary repositories is vendored into the compiled
-FastIPC core.
+compiled FastIPC core 没有 vendor 两者的源码。
 
-The imported upstream examples, FFI bindings, old tests, changelog, screenshot,
-and single-header implementation remain in Git history and, where still
-present in this workspace tree, are historical artifacts only. They are not
-reachable from the current CMake build and their capabilities are not claimed
-as FastIPC features. Broad physical deletion was intentionally not performed
-without a separate destructive-file approval.
+导入的上游 example、FFI binding、旧 test、changelog、screenshot、single-header implementation 保留于 Git 历史；当前 tree 中仍存在的部分也只是 historical artifact，不进入当前 CMake build，其能力不算 FastIPC feature。未取得单独 destructive-file approval，因此没有大范围物理删除。
 
-See [UPSTREAM_DIFF.md](UPSTREAM_DIFF.md) for the exact retained/rewritten/new
-boundary.
+准确边界见 [UPSTREAM_DIFF.md](UPSTREAM_DIFF.md)。
 
-## Limitations
+## 局限
 
-- SPSC only; MPSC/MPMC requires a different reservation and recovery proof.
-- Payloads are copied into and out of fixed-size slots; there is no public
-  zero-copy loan lifetime.
-- Shared-memory peers must use the same Linux ABI and compatible FastIPC layout.
-- Heartbeats provide bounded suspicion, not a proof that a paused process is
-  permanently dead.
-- Recovery fences operations at API boundaries; a process frozen after its
-  final ownership check would need generation-tagged slots/cursors for strict
-  mid-operation fencing.
-- No authentication, encryption, namespace broker, SELinux policy integration,
-  NUMA placement, or real-time scheduling guarantee.
-- UDS sealed-memfd transfer is descriptor-assisted shared memory, not pure
-  socket-copy throughput.
-- WSL2 measurements must be repeated on native Linux and target hardware before
-  deployment decisions.
+- 仅 SPSC；MPSC/MPMC 需要不同 reservation/recovery proof。
+- payload 复制进出 fixed-size slot，没有 public zero-copy loan lifetime。
+- shared-memory peer 必须使用相同 Linux ABI 与兼容 FastIPC layout。
+- heartbeat 只提供 bounded suspicion，不能证明 paused process 永久死亡。
+- recovery 在 API boundary fencing；若 process 在最后一次 ownership check 后冻结，严格 mid-operation fencing 还需要 generation-tagged slot/cursor。
+- 没有 authentication、encryption、namespace broker、SELinux policy integration、NUMA placement 或 real-time scheduling guarantee。
+- UDS sealed-memfd 是 descriptor-assisted shared memory，不是 pure socket-copy throughput。
+- 部署决策前必须在 native Linux 与 target hardware 重测 WSL2 数据。
