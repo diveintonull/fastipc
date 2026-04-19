@@ -27,6 +27,12 @@ struct TransportStats {
   std::uint64_t send_timeouts{0};
   std::uint64_t receive_timeouts{0};
   std::uint64_t corrupt_messages{0};
+  std::uint64_t zero_copy_loans{0};
+  std::uint64_t zero_copy_publishes{0};
+  std::uint64_t zero_copy_takes{0};
+  std::uint64_t zero_copy_releases{0};
+  std::uint64_t producer_loan_reclaims{0};
+  std::uint64_t consumer_loan_reclaims{0};
 };
 
 class Transport {

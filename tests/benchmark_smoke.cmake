@@ -18,15 +18,19 @@ endif()
 set(
     required_fragments
     "\"type\":\"environment\""
-    "\"transport\":\"shared_memory\""
+    "\"transport\":\"fastipc_copy\""
+    "\"transport\":\"fastipc_zero_copy\""
     "\"transport\":\"unix_domain_socket\""
     "\"transport\":\"pipe\""
+    "\"access_pattern\":\"transport_only\""
+    "\"access_pattern\":\"touch_memory\""
     "\"payload_bytes\":64"
     "\"payload_bytes\":1048576"
     "\"messages_per_second\":"
     "\"p50_us\":"
     "\"p95_us\":"
     "\"p99_us\":"
+    "\"p99_9_us\":"
     "\"cpu_time_ms\":"
     "\"voluntary_context_switches\":"
     "\"involuntary_context_switches\":"
@@ -46,8 +50,8 @@ string(
     benchmark_results
     "${benchmark_output}")
 list(LENGTH benchmark_results benchmark_result_count)
-if(NOT benchmark_result_count EQUAL 6)
+if(NOT benchmark_result_count EQUAL 16)
     message(
         FATAL_ERROR
-        "expected 6 benchmark results, got ${benchmark_result_count}")
+        "expected 16 benchmark results, got ${benchmark_result_count}")
 endif()

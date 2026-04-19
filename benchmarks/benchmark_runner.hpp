@@ -13,13 +13,20 @@
 namespace fastipc::benchmark {
 
 enum class TransportKind : std::uint8_t {
-  SharedMemory,
+  FastIpcCopy,
+  FastIpcZeroCopy,
   UnixDomainSocket,
   Pipe,
 };
 
+enum class AccessPattern : std::uint8_t {
+  TransportOnly,
+  TouchMemory,
+};
+
 struct CaseConfig {
-  TransportKind transport{TransportKind::SharedMemory};
+  TransportKind transport{TransportKind::FastIpcCopy};
+  AccessPattern access_pattern{AccessPattern::TransportOnly};
   std::size_t payload_bytes{64U};
   std::size_t iterations{100U};
   std::size_t warmup_iterations{10U};
@@ -30,6 +37,7 @@ struct CaseConfig {
 struct BenchmarkResult {
   std::string transport;
   std::string transport_mode;
+  std::string access_pattern;
   std::size_t payload_bytes{0U};
   std::size_t iterations{0U};
   std::size_t warmup_iterations{0U};
@@ -40,6 +48,7 @@ struct BenchmarkResult {
   double p50_us{0.0};
   double p95_us{0.0};
   double p99_us{0.0};
+  double p99_9_us{0.0};
   double user_cpu_ms{0.0};
   double system_cpu_ms{0.0};
   double cpu_time_ms{0.0};
@@ -65,7 +74,11 @@ struct Environment {
 };
 
 [[nodiscard]] const char* TransportName(TransportKind transport) noexcept;
+[[nodiscard]] const char* AccessPatternName(
+    AccessPattern access_pattern) noexcept;
 [[nodiscard]] std::optional<TransportKind> ParseTransport(
+    std::string_view name) noexcept;
+[[nodiscard]] std::optional<AccessPattern> ParseAccessPattern(
     std::string_view name) noexcept;
 [[nodiscard]] std::vector<std::size_t> RequiredPayloadSizes();
 [[nodiscard]] std::size_t DefaultIterations(std::size_t payload_bytes);

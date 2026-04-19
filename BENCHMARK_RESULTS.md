@@ -1,6 +1,8 @@
 # FastIPC benchmark 结果
 
 本报告来自一次真实 Release run。未经改动的证据是 [2026-08-20-wsl2-gcc13-c5cb58a.jsonl](benchmarks/results/2026-08-20-wsl2-gcc13-c5cb58a.jsonl)；测量定义与限制见 [benchmark-methodology.md](docs/benchmark-methodology.md)。
+
+本页保留升级前 copy/UDS/pipe 的历史基线；新增 FastIPC copy 与 zero-copy 的双访问模式对照、P99.9 和原始 JSONL 见 [ZERO_COPY_BENCHMARK_RESULTS.md](ZERO_COPY_BENCHMARK_RESULTS.md)。
 提交身份改写导致当前提交 ID 与原始证据文件名中的旧 ID 不同；对照见 [提交身份改写映射](../../COMMIT_IDENTITY_MAP.md)。原始 JSONL 未改写。
 
 ## 证据身份

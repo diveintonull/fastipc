@@ -6,16 +6,19 @@ FastIPC 是 Linux C++20 IPC library，基于 `kyr0/libsharedmemory` 深度派生
 ## 能力
 
 - Linux POSIX shared-memory mapping，带 creator/open validation，默认 mode 0600；
-- versioned、endian-marked layout，包含 total size、initialization state、generation；
+- versioned、endian-marked layout，包含 total size、initialization state、generation 与 chunk lifecycle；
 - cache-line 隔离的 SPSC head/tail cursor 与 fixed-capacity slot；
-- 经审计的 acquire/release publication，不依赖 `memory_order_seq_cst`；
+- `Loan/Publish/Take/Release` 零拷贝 ownership API，move-only RAII handle；
+- warmed 成功路径无逐消息普通堆分配，copy API 复用同一 lifecycle；
+- generation、owner token 与 slot state 的 acquire/release/CAS 审计；
 - futex epoch、sleep 前 recheck、monotonic absolute deadline、bounded active spin；
 - PID、Linux process-start tick、role token、heartbeat lease、generation fencing；
 - producer/consumer crash detection、stale segment recovery、restart flow；
 - Block、Timeout、Drop backpressure，返回 typed `Status` 与 counter；
 - `Transport` API，包含 `SharedMemoryTransport`、`UnixDomainSocketTransport`；
 - UDS `SOCK_SEQPACKET`：64 KiB 内 inline frame；更大 payload 使用 sealed-memfd descriptor transfer；
-- 64 B 至 1 MiB 的 cross-process benchmark matrix，并用 pipe 作为第三 baseline；
+- 64 B 至 1 MiB 的 cross-process benchmark matrix，区分 copy/zero-copy 与 transport-only/touch-memory；
+- P50/P95/P99/P99.9、CPU、context switch、RSS 原始 JSONL；
 - 自动 Debug、Release、ASan、UBSan、TSan 覆盖。
 
 ## 架构
@@ -23,12 +26,13 @@ FastIPC 是 Linux C++20 IPC library，基于 `kyr0/libsharedmemory` 深度派生
 ```text
 Application
     |
-    v
-Transport { Send, Receive, Stats, Close }
-    |
     +-- SharedMemoryTransport
-    |      +-- versioned mapped layout
+    |      +-- Copy seam { Send, Receive }
+    |      +-- Ownership seam
+    |      |      { Loan, Publish, Take, Release }
+    |      +-- versioned mapped chunk pool
     |      +-- bounded SPSC ring
+    |      +-- per-slot state / generation / owner identity
     |      +-- active spin -> futex epoch wait
     |      +-- generation / role / heartbeat control plane
     |
@@ -106,6 +110,25 @@ auto received =
     consumer->Receive(destination, fastipc::Deadline::After(100ms));
 ```
 
+零拷贝写法：
+
+```cpp
+auto loan = producer->Loan(
+    4096,
+    {fastipc::BackpressurePolicy::Block,
+     fastipc::Deadline::After(100ms)});
+if (loan) {
+  FillInPlace(loan.value().Data());
+  loan.value().Publish();
+}
+
+auto sample = consumer->Take(fastipc::Deadline::After(100ms));
+if (sample) {
+  ConsumeInPlace(sample.value().Data());
+  sample.value().Release();
+}
+```
+
 producer 与 consumer 通常位于不同 process；这里放在一起仅为展示 public seam。
 
 ## Backpressure 与 failure surface
@@ -122,6 +145,9 @@ producer 与 consumer 通常位于不同 process；这里放在一起仅为展�
 
 ## 证据
 
+- [零拷贝设计](docs/zero-copy-design.md)
+- [chunk 生命周期与恢复矩阵](docs/chunk-lifecycle.md)
+- [Copy 与 Zero-copy 实测结果](ZERO_COPY_BENCHMARK_RESULTS.md)
 - [Benchmark 方法](docs/benchmark-methodology.md)
 - [原始 benchmark 与完整结果](BENCHMARK_RESULTS.md)
 - [两轮 perf 实验与原始 stat/record/report](benchmarks/profiling/README.md)
@@ -167,10 +193,12 @@ compiled FastIPC core 没有 vendor 两者的源码。
 ## 局限
 
 - 仅 SPSC；MPSC/MPMC 需要不同 reservation/recovery proof。
-- payload 复制进出 fixed-size slot，没有 public zero-copy loan lifetime。
+- 每个 endpoint 同时最多一个未完成 loan/sample；slot 与最大 payload 在 setup 时固定。
 - shared-memory peer 必须使用相同 Linux ABI 与兼容 FastIPC layout。
 - heartbeat 只提供 bounded suspicion，不能证明 paused process 永久死亡。
-- recovery 在 API boundary fencing；若 process 在最后一次 ownership check 后冻结，严格 mid-operation fencing 还需要 generation-tagged slot/cursor。
+- 存活但暂停的 producer 持有可写 span 时不可安全撤销；replacement 返回 WouldBlock，直到旧 handle 自行归还或 PID/start-tick 确认进程死亡。
+- consumer sample 为只读，role token 被替换后可至少一次重投递；不声称 exactly-once。
+- layout major 已升级到 2；旧 shared-memory object 会以 LayoutMismatch 拒绝。
 - 没有 authentication、encryption、namespace broker、SELinux policy integration、NUMA placement 或 real-time scheduling guarantee。
 - UDS sealed-memfd 是 descriptor-assisted shared memory，不是 pure socket-copy throughput。
 - 部署决策前必须在 native Linux 与 target hardware 重测 WSL2 数据。

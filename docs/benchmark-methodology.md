@@ -2,21 +2,31 @@
 
 ## 目的
 
-benchmark 在一个可复现 cross-process protocol 下，比较两种 FastIPC transport 与 Linux pipe baseline。它报告 measurement，不声称某种 transport 在所有 workload 下都更快或都适用。
+benchmark 在一个可复现 cross-process protocol 下，比较 FastIPC copy、FastIPC zero-copy、Unix Domain Socket 与 Linux pipe。它报告 measurement，不声称某种 transport 在所有 workload 下都更快或都适用。
 
 ## 必测矩阵
 
 | Transport | 模式 |
 | --- | --- |
-| `shared_memory` | 两条单向 SPSC ring，使用 futex epoch wakeup |
+| `fastipc_copy` | 两条单向 SPSC ring；`Send`/`Receive` 在 ring 与调用方 buffer 之间复制 |
+| `fastipc_zero_copy` | 同一 ring 与 futex protocol；`Loan`/`Take` 直接访问 slot payload |
 | `unix_domain_socket` | `SOCK_SEQPACKET`；64 KiB 内 inline，以上使用 sealed `memfd` + `SCM_RIGHTS` |
 | `pipe` | 两条 nonblocking pipe，每个方向一条 |
 
 payload：64 B、256 B、1 KiB、4 KiB、64 KiB、1 MiB。
 
+## 访问模式
+
+每种 transport 分别运行两种访问模式，避免把“没有读取 1 MiB payload”误报成实际业务吞吐：
+
+| Access pattern | 发送端 | 接收端 | 解释 |
+| --- | --- | --- | --- |
+| `transport_only` | 只写前 8 B sequence | 只读并校验 sequence | 隔离 ownership、同步与 transport 开销；不能当作整块 payload 已处理 |
+| `touch_memory` | 写入全部 payload | 扫描并校验全部 payload | 把应用实际触碰内存的成本纳入，仍不是业务序列化 benchmark |
+
 ## Protocol
 
-每个 case 恰好 fork 一个 child。parent 发送一条 payload，等待 child echo，再发下一条。前 8 B 是 sequence；最终 payload 做 byte-for-byte comparison。
+每个 case 恰好 fork 一个 child。parent 发送一条 payload，等待 child echo，再发下一条。前 8 B 是 sequence；`touch_memory` 对其余字节写入确定性 pattern，接收端扫描并校验整块 payload。
 
 这是 single-outstanding ping-pong：
 
@@ -25,7 +35,7 @@ payload：64 B、256 B、1 KiB、4 KiB、64 KiB、1 MiB。
 3. 不测 saturated multi-producer stream；
 4. throughput 从完成 RTT 推导；一个 RTT 算两条 logical message、传两份 payload。
 
-shared memory 使用分离的 request/reply channel，因为每条 ring 都是 SPSC + unidirectional。socket 为 full duplex；pipe baseline 每方向一条 kernel pipe。
+FastIPC 使用分离的 request/reply channel，因为每条 ring 都是 SPSC + unidirectional。socket 为 full duplex；pipe baseline 每方向一条 kernel pipe。copy endpoint 使用调用方 buffer；zero-copy endpoint 直接执行 `Loan`/`Publish`/`Take`/`Release`，不构造临时 message vector。
 
 ## Iteration 与 warmup
 
@@ -44,11 +54,11 @@ warmup 不进入任何 metric：
 warmup = clamp(iterations / 20, 5, 100)
 ```
 
-command line 可覆盖二者。`--self-test` 在 64 B/1 MiB 只做 3 次 measured + 1 次 warmup，用于校验 harness/schema，不代表性能。
+command line 可覆盖二者。`--self-test` 在 4 种 transport、2 种访问模式、64 B/1 MiB 上各做 3 次 measured + 1 次 warmup，共产生 16 条 result，用于校验 harness/schema，不代表性能。
 
 ## Timing 与 quantile
 
-parent 用 `std::chrono::steady_clock` 记录每个 RTT。P50/P95/P99 对 measured iteration 使用 nearest-rank。wall time 只包围 measured parent loop。
+parent 用 `std::chrono::steady_clock` 记录每个 RTT。P50/P95/P99/P99.9 对 measured iteration 使用 nearest-rank。wall time 只包围 measured parent loop。
 
 ```text
 round_trips_per_second = iterations / wall_seconds
@@ -98,6 +108,8 @@ cmake -S projects/fastipc -B projects/fastipc/build-release \
   -DFASTIPC_BUILD_TESTS=ON -DFASTIPC_BUILD_BENCHMARKS=ON
 cmake --build projects/fastipc/build-release --target fastipc_benchmark
 projects/fastipc/build-release/fastipc_benchmark
+projects/fastipc/build-release/fastipc_benchmark \
+  --transport=fastipc_zero_copy --access=touch_memory
 ```
 
-用 `--help` 查看 transport、payload、iteration、warmup filter。stdout 为 JSONL；diagnostic 与 typed failure 输出到 stderr。
+用 `--help` 查看 transport、access pattern、payload、iteration、warmup filter。stdout 为 JSONL；diagnostic 与 typed failure 输出到 stderr。

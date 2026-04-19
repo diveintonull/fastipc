@@ -39,6 +39,8 @@ namespace {
 using detail::EndpointMetadata;
 using detail::SharedLayout;
 using detail::SlotHeader;
+using detail::SlotOwnerRole;
+using detail::SlotState;
 
 static_assert(__atomic_always_lock_free(sizeof(std::uint32_t), nullptr));
 static_assert(__atomic_always_lock_free(sizeof(std::uint64_t), nullptr));
@@ -63,6 +65,18 @@ void AtomicStore(T* address, T value, int order) noexcept {
 template <typename T>
 T AtomicFetchAdd(T* address, T value, int order) noexcept {
   return __atomic_fetch_add(address, value, order);
+}
+
+template <typename T>
+[[nodiscard]] bool AtomicCompareExchange(
+    T* address, T* expected, T desired, int success_order,
+    int failure_order) noexcept {
+  return __atomic_compare_exchange_n(
+      address, expected, desired, false, success_order, failure_order);
+}
+
+[[nodiscard]] constexpr std::uint32_t StateValue(SlotState state) noexcept {
+  return static_cast<std::uint32_t>(state);
 }
 
 enum class FutexWaitResult : std::uint8_t {
@@ -461,6 +475,87 @@ struct Geometry {
   return reinterpret_cast<SlotHeader*>(base + offset);
 }
 
+[[nodiscard]] std::byte* SlotPayload(SlotHeader* slot) noexcept {
+  return reinterpret_cast<std::byte*>(slot) + sizeof(SlotHeader);
+}
+
+[[nodiscard]] SlotState LoadSlotState(
+    const SlotHeader& slot) noexcept {
+  return static_cast<SlotState>(
+      AtomicLoad(&slot.state, __ATOMIC_ACQUIRE));
+}
+
+[[nodiscard]] bool TransitionSlot(
+    SlotHeader& slot, SlotState expected_state,
+    SlotState desired_state) noexcept {
+  auto expected = StateValue(expected_state);
+  return AtomicCompareExchange(
+      &slot.state, &expected, StateValue(desired_state),
+      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+[[nodiscard]] bool TryAdvanceCursor(
+    std::uint64_t* cursor, std::uint64_t expected) noexcept {
+  return AtomicCompareExchange(
+      cursor, &expected, expected + 1U,
+      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+[[nodiscard]] std::uint64_t NextNonZero(
+    std::uint64_t value) noexcept {
+  ++value;
+  return value == 0U ? 1U : value;
+}
+
+[[nodiscard]] bool SlotMatches(
+    const SlotHeader& slot, SlotState expected_state,
+    std::uint64_t chunk_generation,
+    std::uint64_t owner_generation,
+    std::uint64_t owner_role_token,
+    std::uint64_t owner_channel_generation) noexcept {
+  if (LoadSlotState(slot) != expected_state) {
+    return false;
+  }
+  return slot.chunk_generation == chunk_generation &&
+         slot.owner_generation == owner_generation &&
+         slot.owner_role_token == owner_role_token &&
+         slot.owner_channel_generation == owner_channel_generation;
+}
+
+[[nodiscard]] bool SlotOwnerProcessAlive(
+    const SlotHeader& slot, std::int32_t fallback_pid,
+    std::uint64_t fallback_start_ticks) {
+  const auto pid =
+      slot.owner_pid != 0 ? slot.owner_pid : fallback_pid;
+  const auto start_ticks =
+      slot.owner_process_start_ticks != 0U
+          ? slot.owner_process_start_ticks
+          : fallback_start_ticks;
+  return ProcessIdentityAlive(pid, start_ticks);
+}
+
+[[nodiscard]] bool SlotOwnedByLiveEndpoint(
+    const SlotHeader& slot, const EndpointMetadata& metadata,
+    SlotOwnerRole expected_role) {
+  if (slot.owner_role != static_cast<std::uint32_t>(expected_role) ||
+      !ProcessIdentityAlive(
+          slot.owner_pid, slot.owner_process_start_ticks)) {
+    return false;
+  }
+  const auto metadata_pid =
+      AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE);
+  if (metadata_pid != slot.owner_pid) {
+    return false;
+  }
+  return AtomicLoad(
+             &metadata.process_start_ticks,
+             __ATOMIC_ACQUIRE) ==
+             slot.owner_process_start_ticks &&
+         AtomicLoad(&metadata.role_token, __ATOMIC_ACQUIRE) ==
+             slot.owner_role_token &&
+         AtomicLoad(&metadata.state, __ATOMIC_ACQUIRE) != 0U;
+}
+
 void CpuRelax() noexcept {
 #if defined(__x86_64__) || defined(__i386__)
   __builtin_ia32_pause();
@@ -519,8 +614,11 @@ struct SharedMemoryTransport::Impl {
   std::uint32_t active_spin_count{0};
   std::uint64_t process_start_ticks{0};
   std::uint64_t role_token{0};
+  std::int32_t replaced_process_id{0};
+  std::uint64_t replaced_process_start_ticks{0U};
   std::atomic<std::uint64_t> observed_generation{0};
   std::atomic<std::uint64_t> next_peer_identity_probe_ns{0};
+  std::mutex zero_copy_mutex;
   std::mutex operation_mutex;
   std::condition_variable operation_cv;
   std::size_t active_operations{0U};
@@ -563,7 +661,18 @@ struct SharedMemoryTransport::Impl {
     bool acquired_{false};
   };
 
-  ~Impl() { Close(); }
+  ~Impl() {
+    Close();
+    if (mapping != MAP_FAILED) {
+      static_cast<void>(::munmap(mapping, mapped_bytes));
+      mapping = MAP_FAILED;
+      layout = nullptr;
+    }
+    if (descriptor >= 0) {
+      static_cast<void>(::close(descriptor));
+      descriptor = -1;
+    }
+  }
 
   [[nodiscard]] EndpointMetadata& RoleMetadata() noexcept {
     return role == Role::Producer ? layout->producer : layout->consumer;
@@ -580,6 +689,129 @@ struct SharedMemoryTransport::Impl {
            AtomicLoad(&metadata.process_start_ticks, __ATOMIC_ACQUIRE) ==
                process_start_ticks &&
            AtomicLoad(&metadata.role_token, __ATOMIC_ACQUIRE) == role_token;
+  }
+
+  void WakeData() noexcept {
+    AtomicFetchAdd(&layout->producer_cursor.data_epoch,
+                   std::uint32_t{1}, __ATOMIC_RELEASE);
+    FutexWake(&layout->producer_cursor.data_epoch);
+  }
+
+  void WakeSpace() noexcept {
+    AtomicFetchAdd(&layout->consumer_cursor.space_epoch,
+                   std::uint32_t{1}, __ATOMIC_RELEASE);
+    FutexWake(&layout->consumer_cursor.space_epoch);
+  }
+
+  [[nodiscard]] Status RecoverProducerHeadSlot() {
+    const auto head =
+        AtomicLoad(&layout->producer_cursor.head, __ATOMIC_RELAXED);
+    auto& slot = *SlotAt(layout, head);
+    const auto state = LoadSlotState(slot);
+    switch (state) {
+      case SlotState::Free:
+        return Status::Ok();
+      case SlotState::Published:
+        if (slot.sequence != head + 1U ||
+            slot.length > layout->queue.max_message_size) {
+          return Status(StatusCode::CorruptData,
+                        "published chunk cannot complete cursor recovery");
+        }
+        if (!TryAdvanceCursor(
+                &layout->producer_cursor.head, head)) {
+          return Status::Ok();
+        }
+        AtomicFetchAdd(&layout->producer_cursor.sent_messages,
+                       std::uint64_t{1}, __ATOMIC_RELAXED);
+        AtomicFetchAdd(&layout->producer_cursor.zero_copy_publishes,
+                       std::uint64_t{1}, __ATOMIC_RELAXED);
+        AtomicFetchAdd(&layout->producer_cursor.reclaimed_loans,
+                       std::uint64_t{1}, __ATOMIC_RELAXED);
+        WakeData();
+        return Status::Ok();
+      case SlotState::ProducerClaiming:
+      case SlotState::ClaimedByProducer: {
+        if (SlotOwnerProcessAlive(
+                slot, replaced_process_id,
+                replaced_process_start_ticks)) {
+          return Status(StatusCode::WouldBlock,
+                        "previous producer still owns an unfinished loan");
+        }
+        if (!TransitionSlot(slot, state, SlotState::Free)) {
+          return Status(StatusCode::WouldBlock,
+                        "producer loan state changed during recovery");
+        }
+        AtomicFetchAdd(&layout->producer_cursor.reclaimed_loans,
+                       std::uint64_t{1}, __ATOMIC_RELAXED);
+        WakeSpace();
+        return Status::Ok();
+      }
+      case SlotState::ConsumerTaking:
+      case SlotState::LoanedToConsumer:
+        return Status(StatusCode::WouldBlock,
+                      "consumer still pins the next producer chunk");
+    }
+    return Status(StatusCode::CorruptData,
+                  "unknown producer slot lifecycle state");
+  }
+
+  [[nodiscard]] Status RecoverConsumerTailSlot() {
+    const auto tail =
+        AtomicLoad(&layout->consumer_cursor.tail, __ATOMIC_RELAXED);
+    const auto head =
+        AtomicLoad(&layout->producer_cursor.head, __ATOMIC_ACQUIRE);
+    if (tail == head) {
+      return Status::Ok();
+    }
+    auto& slot = *SlotAt(layout, tail);
+    const auto state = LoadSlotState(slot);
+    switch (state) {
+      case SlotState::Published:
+        return Status::Ok();
+      case SlotState::ConsumerTaking: {
+        if (SlotOwnerProcessAlive(
+                slot, replaced_process_id,
+                replaced_process_start_ticks)) {
+          return Status(StatusCode::WouldBlock,
+                        "previous consumer is still taking the sample");
+        }
+        [[fallthrough]];
+      }
+      case SlotState::LoanedToConsumer:
+        if (state == SlotState::LoanedToConsumer &&
+            SlotOwnedByLiveEndpoint(
+                slot, layout->consumer,
+                SlotOwnerRole::Consumer)) {
+          return Status(StatusCode::WouldBlock,
+                        "previous consumer still owns the sample");
+        }
+        if (!TransitionSlot(slot, state, SlotState::Published)) {
+          return Status(StatusCode::WouldBlock,
+                        "consumer loan state changed during recovery");
+        }
+        AtomicFetchAdd(&layout->consumer_cursor.reclaimed_loans,
+                       std::uint64_t{1}, __ATOMIC_RELAXED);
+        WakeData();
+        return Status::Ok();
+      case SlotState::Free:
+        if (!TryAdvanceCursor(&layout->consumer_cursor.tail, tail)) {
+          return Status::Ok();
+        }
+        AtomicFetchAdd(&layout->consumer_cursor.received_messages,
+                       std::uint64_t{1}, __ATOMIC_RELAXED);
+        AtomicFetchAdd(&layout->consumer_cursor.zero_copy_releases,
+                       std::uint64_t{1}, __ATOMIC_RELAXED);
+        AtomicFetchAdd(&layout->consumer_cursor.reclaimed_loans,
+                       std::uint64_t{1}, __ATOMIC_RELAXED);
+        WakeSpace();
+        return Status::Ok();
+      case SlotState::ProducerClaiming:
+      case SlotState::ClaimedByProducer:
+        return Status(StatusCode::CorruptData,
+                      "head exposed an unpublished producer chunk");
+    }
+    return Status(StatusCode::CorruptData,
+                  "unknown consumer slot lifecycle state");
   }
 
   [[nodiscard]] Status StartHeartbeat() {
@@ -656,11 +888,6 @@ struct SharedMemoryTransport::Impl {
       FutexWake(epoch);
     }
 
-    if (mapping != MAP_FAILED) {
-      ::munmap(mapping, mapped_bytes);
-      mapping = MAP_FAILED;
-      layout = nullptr;
-    }
     if (descriptor >= 0) {
       ::close(descriptor);
       descriptor = -1;
@@ -755,6 +982,11 @@ SharedMemoryTransport::CreateProducerImpl(const ChannelConfig& config) {
       return Status(StatusCode::RoleConflict,
                     "a live producer already owns this channel");
     }
+    impl->replaced_process_id =
+        AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE);
+    impl->replaced_process_start_ticks =
+        AtomicLoad(&metadata.process_start_ticks,
+                   __ATOMIC_ACQUIRE);
 
     const auto previous_generation =
         AtomicLoad(&impl->layout->header.generation, __ATOMIC_ACQUIRE);
@@ -944,6 +1176,11 @@ SharedMemoryTransport::OpenConsumerImpl(const ChannelConfig& config) {
     return Status(StatusCode::RoleConflict,
                   "a live consumer already owns this channel");
   }
+  impl->replaced_process_id =
+      AtomicLoad(&metadata.pid, __ATOMIC_ACQUIRE);
+  impl->replaced_process_start_ticks =
+      AtomicLoad(&metadata.process_start_ticks,
+                 __ATOMIC_ACQUIRE);
 
   const auto process_start_ticks = ProcessStartTicks(::getpid());
   const auto role_token = GenerateRoleToken();
@@ -971,10 +1208,12 @@ SharedMemoryTransport::OpenConsumerImpl(const ChannelConfig& config) {
   return impl;
 }
 
-SharedMemoryTransport::SharedMemoryTransport(std::unique_ptr<Impl> impl)
+SharedMemoryTransport::SharedMemoryTransport(std::shared_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 
-SharedMemoryTransport::~SharedMemoryTransport() = default;
+SharedMemoryTransport::~SharedMemoryTransport() {
+  Close();
+}
 
 Result<std::unique_ptr<SharedMemoryTransport>>
 SharedMemoryTransport::CreateProducer(const ChannelConfig& config) {
@@ -982,8 +1221,11 @@ SharedMemoryTransport::CreateProducer(const ChannelConfig& config) {
   if (!impl) {
     return impl.status();
   }
+  std::unique_ptr<Impl> owned =
+      std::move(impl).take_value();
   return std::unique_ptr<SharedMemoryTransport>(
-      new SharedMemoryTransport(std::move(impl).take_value()));
+      new SharedMemoryTransport(
+          std::shared_ptr<Impl>(std::move(owned))));
 }
 
 Result<std::unique_ptr<SharedMemoryTransport>>
@@ -992,12 +1234,328 @@ SharedMemoryTransport::OpenConsumer(const ChannelConfig& config) {
   if (!impl) {
     return impl.status();
   }
+  std::unique_ptr<Impl> owned =
+      std::move(impl).take_value();
   return std::unique_ptr<SharedMemoryTransport>(
-      new SharedMemoryTransport(std::move(impl).take_value()));
+      new SharedMemoryTransport(
+          std::shared_ptr<Impl>(std::move(owned))));
 }
 
-Status SharedMemoryTransport::Send(std::span<const std::byte> message,
-                                   SendOptions options) {
+PublisherLoan::PublisherLoan(
+    std::shared_ptr<void> transport, void* slot,
+    std::size_t payload_size, std::uint64_t cursor,
+    std::uint64_t chunk_generation,
+    std::uint64_t owner_generation,
+    std::uint64_t owner_role_token,
+    std::uint64_t owner_channel_generation)
+    : transport_(std::move(transport)),
+      slot_(slot),
+      payload_size_(payload_size),
+      cursor_(cursor),
+      chunk_generation_(chunk_generation),
+      owner_generation_(owner_generation),
+      owner_role_token_(owner_role_token),
+      owner_channel_generation_(owner_channel_generation),
+      active_(true) {}
+
+PublisherLoan::~PublisherLoan() {
+  static_cast<void>(Abandon());
+}
+
+PublisherLoan::PublisherLoan(PublisherLoan&& other) noexcept
+    : transport_(std::move(other.transport_)),
+      slot_(std::exchange(other.slot_, nullptr)),
+      payload_size_(std::exchange(other.payload_size_, 0U)),
+      cursor_(std::exchange(other.cursor_, 0U)),
+      chunk_generation_(
+          std::exchange(other.chunk_generation_, 0U)),
+      owner_generation_(
+          std::exchange(other.owner_generation_, 0U)),
+      owner_role_token_(
+          std::exchange(other.owner_role_token_, 0U)),
+      owner_channel_generation_(
+          std::exchange(other.owner_channel_generation_, 0U)),
+      active_(std::exchange(other.active_, false)) {}
+
+PublisherLoan& PublisherLoan::operator=(PublisherLoan&& other) noexcept {
+  if (this != &other) {
+    static_cast<void>(Abandon());
+    transport_ = std::move(other.transport_);
+    slot_ = std::exchange(other.slot_, nullptr);
+    payload_size_ = std::exchange(other.payload_size_, 0U);
+    cursor_ = std::exchange(other.cursor_, 0U);
+    chunk_generation_ =
+        std::exchange(other.chunk_generation_, 0U);
+    owner_generation_ =
+        std::exchange(other.owner_generation_, 0U);
+    owner_role_token_ =
+        std::exchange(other.owner_role_token_, 0U);
+    owner_channel_generation_ =
+        std::exchange(other.owner_channel_generation_, 0U);
+    active_ = std::exchange(other.active_, false);
+  }
+  return *this;
+}
+
+std::span<std::byte> PublisherLoan::Data() noexcept {
+  if (!transport_ || !active_ || slot_ == nullptr) {
+    return {};
+  }
+  return {SlotPayload(static_cast<SlotHeader*>(slot_)),
+          payload_size_};
+}
+
+std::size_t PublisherLoan::size() const noexcept {
+  return transport_ && active_ ? payload_size_ : 0U;
+}
+
+PublisherLoan::operator bool() const noexcept {
+  return transport_ && active_;
+}
+
+Status PublisherLoan::Abandon() noexcept {
+  if (!transport_ || !active_) {
+    return Status::Ok();
+  }
+  auto& transport =
+      *static_cast<SharedMemoryTransport::Impl*>(transport_.get());
+  auto& slot = *static_cast<SlotHeader*>(slot_);
+  Status result = Status::Ok();
+  if (!SlotMatches(
+          slot, SlotState::ClaimedByProducer,
+          chunk_generation_, owner_generation_,
+          owner_role_token_, owner_channel_generation_) ||
+      !TransitionSlot(
+          slot, SlotState::ClaimedByProducer,
+          SlotState::Free)) {
+    result = Status(StatusCode::StaleGeneration);
+  } else {
+    transport.WakeSpace();
+  }
+  active_ = false;
+  slot_ = nullptr;
+  transport_.reset();
+  return result;
+}
+
+Status PublisherLoan::Publish() noexcept {
+  if (!transport_ || !active_) {
+    return Status(StatusCode::Closed);
+  }
+  auto& transport =
+      *static_cast<SharedMemoryTransport::Impl*>(transport_.get());
+  auto& slot = *static_cast<SlotHeader*>(slot_);
+  if (transport.closed.load(std::memory_order_acquire)) {
+    static_cast<void>(Abandon());
+    return Status(StatusCode::Closed);
+  }
+  const auto current_generation =
+      AtomicLoad(&transport.layout->header.generation,
+                 __ATOMIC_ACQUIRE);
+  if (!transport.OwnsRole() ||
+      transport.role != Role::Producer ||
+      current_generation != owner_channel_generation_ ||
+      current_generation !=
+          transport.observed_generation.load(
+              std::memory_order_acquire)) {
+    static_cast<void>(Abandon());
+    return Status(StatusCode::StaleGeneration);
+  }
+  const auto head = AtomicLoad(
+      &transport.layout->producer_cursor.head,
+      __ATOMIC_RELAXED);
+  if (head != cursor_ ||
+      !SlotMatches(
+          slot, SlotState::ClaimedByProducer,
+          chunk_generation_, owner_generation_,
+          owner_role_token_, owner_channel_generation_)) {
+    static_cast<void>(Abandon());
+    return Status(StatusCode::StaleGeneration);
+  }
+  if (!TransitionSlot(
+          slot, SlotState::ClaimedByProducer,
+          SlotState::Published)) {
+    active_ = false;
+    slot_ = nullptr;
+    transport_.reset();
+    return Status(StatusCode::StaleGeneration);
+  }
+
+  if (!TryAdvanceCursor(
+          &transport.layout->producer_cursor.head, cursor_)) {
+    active_ = false;
+    slot_ = nullptr;
+    transport_.reset();
+    return Status(StatusCode::StaleGeneration);
+  }
+  transport.WakeData();
+  AtomicFetchAdd(
+      &transport.layout->producer_cursor.sent_messages,
+      std::uint64_t{1}, __ATOMIC_RELAXED);
+  AtomicFetchAdd(
+      &transport.layout->producer_cursor.zero_copy_publishes,
+      std::uint64_t{1}, __ATOMIC_RELAXED);
+  AtomicFetchAdd(
+      &transport.layout->producer.operation_sequence,
+      std::uint64_t{1}, __ATOMIC_RELAXED);
+  active_ = false;
+  slot_ = nullptr;
+  transport_.reset();
+  return Status::Ok();
+}
+
+SubscriberSample::SubscriberSample(
+    std::shared_ptr<void> transport, void* slot,
+    std::size_t payload_size, std::uint64_t cursor,
+    std::uint64_t chunk_generation,
+    std::uint64_t owner_generation,
+    std::uint64_t owner_role_token,
+    std::uint64_t owner_channel_generation)
+    : transport_(std::move(transport)),
+      slot_(slot),
+      payload_size_(payload_size),
+      cursor_(cursor),
+      chunk_generation_(chunk_generation),
+      owner_generation_(owner_generation),
+      owner_role_token_(owner_role_token),
+      owner_channel_generation_(owner_channel_generation),
+      active_(true) {}
+
+SubscriberSample::~SubscriberSample() {
+  static_cast<void>(Release());
+}
+
+SubscriberSample::SubscriberSample(
+    SubscriberSample&& other) noexcept
+    : transport_(std::move(other.transport_)),
+      slot_(std::exchange(other.slot_, nullptr)),
+      payload_size_(std::exchange(other.payload_size_, 0U)),
+      cursor_(std::exchange(other.cursor_, 0U)),
+      chunk_generation_(
+          std::exchange(other.chunk_generation_, 0U)),
+      owner_generation_(
+          std::exchange(other.owner_generation_, 0U)),
+      owner_role_token_(
+          std::exchange(other.owner_role_token_, 0U)),
+      owner_channel_generation_(
+          std::exchange(other.owner_channel_generation_, 0U)),
+      active_(std::exchange(other.active_, false)) {}
+
+SubscriberSample& SubscriberSample::operator=(
+    SubscriberSample&& other) noexcept {
+  if (this != &other) {
+    static_cast<void>(Release());
+    transport_ = std::move(other.transport_);
+    slot_ = std::exchange(other.slot_, nullptr);
+    payload_size_ = std::exchange(other.payload_size_, 0U);
+    cursor_ = std::exchange(other.cursor_, 0U);
+    chunk_generation_ =
+        std::exchange(other.chunk_generation_, 0U);
+    owner_generation_ =
+        std::exchange(other.owner_generation_, 0U);
+    owner_role_token_ =
+        std::exchange(other.owner_role_token_, 0U);
+    owner_channel_generation_ =
+        std::exchange(other.owner_channel_generation_, 0U);
+    active_ = std::exchange(other.active_, false);
+  }
+  return *this;
+}
+
+std::span<const std::byte> SubscriberSample::Data() const noexcept {
+  if (!transport_ || !active_ || slot_ == nullptr) {
+    return {};
+  }
+  return {SlotPayload(static_cast<SlotHeader*>(slot_)),
+          payload_size_};
+}
+
+std::size_t SubscriberSample::size() const noexcept {
+  return transport_ && active_ ? payload_size_ : 0U;
+}
+
+SubscriberSample::operator bool() const noexcept {
+  return transport_ && active_;
+}
+
+Status SubscriberSample::Release() noexcept {
+  if (!transport_ || !active_) {
+    return Status::Ok();
+  }
+  auto& transport =
+      *static_cast<SharedMemoryTransport::Impl*>(transport_.get());
+  auto& slot = *static_cast<SlotHeader*>(slot_);
+  const bool endpoint_is_current =
+      !transport.closed.load(std::memory_order_acquire) &&
+      transport.role == Role::Consumer &&
+      transport.OwnsRole();
+  const auto tail = AtomicLoad(
+      &transport.layout->consumer_cursor.tail,
+      __ATOMIC_RELAXED);
+  if (tail != cursor_ ||
+      !SlotMatches(
+          slot, SlotState::LoanedToConsumer,
+          chunk_generation_, owner_generation_,
+          owner_role_token_, owner_channel_generation_) ||
+      !TransitionSlot(
+          slot, SlotState::LoanedToConsumer,
+          SlotState::Free)) {
+    active_ = false;
+    slot_ = nullptr;
+    transport_.reset();
+    return Status(StatusCode::StaleGeneration);
+  }
+
+  const bool advanced = TryAdvanceCursor(
+      &transport.layout->consumer_cursor.tail, cursor_);
+  if (advanced) {
+    transport.WakeSpace();
+    AtomicFetchAdd(
+        &transport.layout->consumer_cursor.received_messages,
+        std::uint64_t{1}, __ATOMIC_RELAXED);
+    AtomicFetchAdd(
+        &transport.layout->consumer_cursor.zero_copy_releases,
+        std::uint64_t{1}, __ATOMIC_RELAXED);
+    AtomicFetchAdd(
+        &transport.layout->consumer.operation_sequence,
+        std::uint64_t{1}, __ATOMIC_RELAXED);
+  }
+  active_ = false;
+  slot_ = nullptr;
+  transport_.reset();
+  return endpoint_is_current && advanced
+             ? Status::Ok()
+             : Status(StatusCode::StaleGeneration);
+}
+
+Status SubscriberSample::Requeue() noexcept {
+  if (!transport_ || !active_) {
+    return Status(StatusCode::Closed);
+  }
+  auto& transport =
+      *static_cast<SharedMemoryTransport::Impl*>(transport_.get());
+  auto& slot = *static_cast<SlotHeader*>(slot_);
+  if (!SlotMatches(
+          slot, SlotState::LoanedToConsumer,
+          chunk_generation_, owner_generation_,
+          owner_role_token_, owner_channel_generation_) ||
+      !TransitionSlot(
+          slot, SlotState::LoanedToConsumer,
+          SlotState::Published)) {
+    active_ = false;
+    slot_ = nullptr;
+    transport_.reset();
+    return Status(StatusCode::StaleGeneration);
+  }
+  transport.WakeData();
+  active_ = false;
+  slot_ = nullptr;
+  transport_.reset();
+  return Status::Ok();
+}
+
+Result<PublisherLoan> SharedMemoryTransport::Loan(
+    std::size_t size, SendOptions options) {
   if (!impl_) {
     return Status(StatusCode::Closed);
   }
@@ -1005,119 +1563,148 @@ Status SharedMemoryTransport::Send(std::span<const std::byte> message,
   if (!operation.acquired()) {
     return Status(StatusCode::Closed);
   }
+  std::lock_guard zero_copy_lock(impl_->zero_copy_mutex);
   if (impl_->role != Role::Producer) {
     return Status(StatusCode::RoleConflict,
-                  "consumer endpoint cannot send");
+                  "consumer endpoint cannot loan");
   }
   if (!impl_->OwnsRole()) {
     return Status(StatusCode::StaleGeneration,
                   "producer role was reclaimed by another endpoint");
   }
-
-  auto& layout = *impl_->layout;
-  const auto current_generation =
-      AtomicLoad(&layout.header.generation, __ATOMIC_ACQUIRE);
-  if (current_generation !=
-      impl_->observed_generation.load(std::memory_order_acquire)) {
-    return Status(StatusCode::StaleGeneration,
-                  "producer was fenced by a newer channel generation");
-  }
-  if (message.size() > layout.queue.max_message_size) {
+  if (size > impl_->layout->queue.max_message_size) {
     return Status(StatusCode::MessageTooLarge);
   }
 
-  std::uint64_t head = 0;
+  auto& layout = *impl_->layout;
   for (;;) {
     if (impl_->closed.load(std::memory_order_acquire)) {
       return Status(StatusCode::Closed);
     }
-    head = AtomicLoad(&layout.producer_cursor.head, __ATOMIC_RELAXED);
+    const auto current_generation =
+        AtomicLoad(&layout.header.generation, __ATOMIC_ACQUIRE);
+    if (!impl_->OwnsRole() ||
+        current_generation !=
+            impl_->observed_generation.load(
+                std::memory_order_acquire)) {
+      return Status(StatusCode::StaleGeneration);
+    }
+
+    const auto head =
+        AtomicLoad(&layout.producer_cursor.head,
+                   __ATOMIC_RELAXED);
     const auto tail =
-        AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_ACQUIRE);
-    if (head - tail < layout.queue.slot_count) {
-      break;
-    }
-
-    if (options.policy == BackpressurePolicy::Drop) {
-      AtomicFetchAdd(&layout.producer_cursor.dropped_messages,
-                     std::uint64_t{1}, __ATOMIC_RELAXED);
-      return Status(StatusCode::Dropped);
-    }
-    if (options.deadline.expired()) {
-      AtomicFetchAdd(&layout.producer_cursor.timeout_count,
-                     std::uint64_t{1}, __ATOMIC_RELAXED);
-      return Status(StatusCode::Timeout);
-    }
-    if (SpinForSpace(layout, impl_->active_spin_count, &head)) {
-      if (impl_->closed.load(std::memory_order_acquire)) {
-        return Status(StatusCode::Closed);
+        AtomicLoad(&layout.consumer_cursor.tail,
+                   __ATOMIC_ACQUIRE);
+    if (head - tail >= layout.queue.slot_count) {
+      if (options.policy == BackpressurePolicy::Drop) {
+        AtomicFetchAdd(
+            &layout.producer_cursor.dropped_messages,
+            std::uint64_t{1}, __ATOMIC_RELAXED);
+        return Status(StatusCode::Dropped);
       }
-      break;
-    }
-    if (impl_->closed.load(std::memory_order_acquire)) {
-      return Status(StatusCode::Closed);
-    }
-    if (options.deadline.expired()) {
-      AtomicFetchAdd(&layout.producer_cursor.timeout_count,
-                     std::uint64_t{1}, __ATOMIC_RELAXED);
-      return Status(StatusCode::Timeout);
-    }
-    const auto peer_status = PeerStatus(
-        layout.consumer, impl_->peer_timeout,
-        impl_->next_peer_identity_probe_ns);
-    if (!peer_status) {
-      return peer_status;
-    }
-
-    const auto expected_epoch =
-        AtomicLoad(&layout.consumer_cursor.space_epoch, __ATOMIC_ACQUIRE);
-    const auto rechecked_head =
-        AtomicLoad(&layout.producer_cursor.head, __ATOMIC_RELAXED);
-    const auto rechecked_tail =
-        AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_ACQUIRE);
-    if (rechecked_head - rechecked_tail < layout.queue.slot_count) {
+      if (options.deadline.expired()) {
+        AtomicFetchAdd(
+            &layout.producer_cursor.timeout_count,
+            std::uint64_t{1}, __ATOMIC_RELAXED);
+        return Status(StatusCode::Timeout);
+      }
+      std::uint64_t spun_head = head;
+      if (SpinForSpace(
+              layout, impl_->active_spin_count,
+              &spun_head)) {
+        continue;
+      }
+      const auto peer_status = PeerStatus(
+          layout.consumer, impl_->peer_timeout,
+          impl_->next_peer_identity_probe_ns);
+      if (!peer_status) {
+        return peer_status;
+      }
+      const auto expected_epoch = AtomicLoad(
+          &layout.consumer_cursor.space_epoch,
+          __ATOMIC_ACQUIRE);
+      const auto rechecked_head = AtomicLoad(
+          &layout.producer_cursor.head, __ATOMIC_RELAXED);
+      const auto rechecked_tail = AtomicLoad(
+          &layout.consumer_cursor.tail, __ATOMIC_ACQUIRE);
+      if (rechecked_head - rechecked_tail <
+          layout.queue.slot_count) {
+        continue;
+      }
+      const auto wait = FutexWait(
+          &layout.consumer_cursor.space_epoch,
+          expected_epoch,
+          ProbeDeadline(options.deadline,
+                        impl_->peer_timeout));
+      if (wait.result == FutexWaitResult::Error) {
+        return Status(
+            StatusCode::IoError,
+            "futex wait for chunk space failed",
+            wait.error);
+      }
       continue;
     }
 
-    if (impl_->closed.load(std::memory_order_acquire)) {
-      return Status(StatusCode::Closed);
+    auto& slot = *SlotAt(&layout, head);
+    if (LoadSlotState(slot) != SlotState::Free) {
+      const auto recovery = impl_->RecoverProducerHeadSlot();
+      if (!recovery) {
+        return recovery;
+      }
+      if (AtomicLoad(&layout.producer_cursor.head,
+                     __ATOMIC_RELAXED) != head) {
+        continue;
+      }
+      if (LoadSlotState(slot) != SlotState::Free) {
+        continue;
+      }
     }
-    const auto wait =
-        FutexWait(&layout.consumer_cursor.space_epoch, expected_epoch,
-                  ProbeDeadline(options.deadline, impl_->peer_timeout));
-    if (wait.result == FutexWaitResult::TimedOut) {
+    if (!impl_->OwnsRole() ||
+        AtomicLoad(&layout.header.generation,
+                   __ATOMIC_ACQUIRE) != current_generation) {
+      return Status(StatusCode::StaleGeneration);
+    }
+    if (!TransitionSlot(
+            slot, SlotState::Free,
+            SlotState::ProducerClaiming)) {
       continue;
     }
-    if (wait.result == FutexWaitResult::Error) {
-      return Status(StatusCode::IoError, "futex wait for queue space failed",
-                    wait.error);
-    }
-  }
 
-  if (impl_->closed.load(std::memory_order_acquire)) {
-    return Status(StatusCode::Closed);
-  }
-  SlotHeader* slot = SlotAt(&layout, head);
-  slot->length = static_cast<std::uint32_t>(message.size());
-  slot->sequence = head + 1U;
-  auto* payload = reinterpret_cast<std::byte*>(slot) + sizeof(SlotHeader);
-  if (!message.empty()) {
-    std::memcpy(payload, message.data(), message.size());
-  }
+    const auto chunk_generation =
+        NextNonZero(slot.chunk_generation);
+    const auto owner_generation =
+        NextNonZero(slot.owner_generation);
+    slot.length = static_cast<std::uint32_t>(size);
+    slot.sequence = head + 1U;
+    slot.chunk_generation = chunk_generation;
+    slot.owner_generation = owner_generation;
+    slot.owner_pid = static_cast<std::int32_t>(::getpid());
+    slot.owner_role =
+        static_cast<std::uint32_t>(SlotOwnerRole::Producer);
+    slot.owner_process_start_ticks =
+        impl_->process_start_ticks;
+    slot.owner_role_token = impl_->role_token;
+    slot.owner_channel_generation = current_generation;
+    AtomicStore(&slot.state,
+                StateValue(SlotState::ClaimedByProducer),
+                __ATOMIC_RELEASE);
 
-  AtomicStore(&layout.producer_cursor.head, head + 1U, __ATOMIC_RELEASE);
-  AtomicFetchAdd(&layout.producer_cursor.data_epoch, std::uint32_t{1},
-                 __ATOMIC_RELEASE);
-  FutexWake(&layout.producer_cursor.data_epoch);
-  AtomicFetchAdd(&layout.producer_cursor.sent_messages, std::uint64_t{1},
-                 __ATOMIC_RELAXED);
-  AtomicFetchAdd(&layout.producer.operation_sequence, std::uint64_t{1},
-                 __ATOMIC_RELAXED);
-  return Status::Ok();
+    AtomicFetchAdd(
+        &layout.producer_cursor.zero_copy_loans,
+        std::uint64_t{1}, __ATOMIC_RELAXED);
+    AtomicFetchAdd(
+        &layout.producer.operation_sequence,
+        std::uint64_t{1}, __ATOMIC_RELAXED);
+    return PublisherLoan(
+        impl_, &slot, size, head, chunk_generation,
+        owner_generation, impl_->role_token,
+        current_generation);
+  }
 }
 
-Result<std::size_t> SharedMemoryTransport::Receive(
-    std::span<std::byte> destination, Deadline deadline) {
+Result<SubscriberSample> SharedMemoryTransport::Take(
+    Deadline deadline) {
   if (!impl_) {
     return Status(StatusCode::Closed);
   }
@@ -1125,9 +1712,10 @@ Result<std::size_t> SharedMemoryTransport::Receive(
   if (!operation.acquired()) {
     return Status(StatusCode::Closed);
   }
+  std::lock_guard zero_copy_lock(impl_->zero_copy_mutex);
   if (impl_->role != Role::Consumer) {
     return Status(StatusCode::RoleConflict,
-                  "producer endpoint cannot receive");
+                  "producer endpoint cannot take");
   }
   if (!impl_->OwnsRole()) {
     return Status(StatusCode::StaleGeneration,
@@ -1135,107 +1723,166 @@ Result<std::size_t> SharedMemoryTransport::Receive(
   }
 
   auto& layout = *impl_->layout;
-  const auto current_generation =
-      AtomicLoad(&layout.header.generation, __ATOMIC_ACQUIRE);
-  if (current_generation !=
-      impl_->observed_generation.load(std::memory_order_acquire)) {
-    impl_->observed_generation.store(current_generation,
-                                     std::memory_order_release);
-    AtomicStore(&layout.consumer.generation, current_generation,
-                __ATOMIC_RELEASE);
-  }
-  std::uint64_t tail = 0;
   for (;;) {
     if (impl_->closed.load(std::memory_order_acquire)) {
       return Status(StatusCode::Closed);
     }
-    tail = AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_RELAXED);
+    const auto current_generation =
+        AtomicLoad(&layout.header.generation, __ATOMIC_ACQUIRE);
+    if (current_generation !=
+        impl_->observed_generation.load(
+            std::memory_order_acquire)) {
+      impl_->observed_generation.store(
+          current_generation, std::memory_order_release);
+      AtomicStore(&layout.consumer.generation,
+                  current_generation, __ATOMIC_RELEASE);
+    }
+
+    const auto tail =
+        AtomicLoad(&layout.consumer_cursor.tail,
+                   __ATOMIC_RELAXED);
     const auto head =
-        AtomicLoad(&layout.producer_cursor.head, __ATOMIC_ACQUIRE);
-    if (tail != head) {
-      break;
-    }
-    if (deadline.expired()) {
-      AtomicFetchAdd(&layout.consumer_cursor.timeout_count,
-                     std::uint64_t{1}, __ATOMIC_RELAXED);
-      return Status(StatusCode::Timeout);
-    }
-    if (SpinForData(layout, impl_->active_spin_count, &tail)) {
-      if (impl_->closed.load(std::memory_order_acquire)) {
-        return Status(StatusCode::Closed);
+        AtomicLoad(&layout.producer_cursor.head,
+                   __ATOMIC_ACQUIRE);
+    if (tail == head) {
+      if (deadline.expired()) {
+        AtomicFetchAdd(
+            &layout.consumer_cursor.timeout_count,
+            std::uint64_t{1}, __ATOMIC_RELAXED);
+        return Status(StatusCode::Timeout);
       }
-      break;
-    }
-    if (impl_->closed.load(std::memory_order_acquire)) {
-      return Status(StatusCode::Closed);
-    }
-    if (deadline.expired()) {
-      AtomicFetchAdd(&layout.consumer_cursor.timeout_count,
-                     std::uint64_t{1}, __ATOMIC_RELAXED);
-      return Status(StatusCode::Timeout);
-    }
-    const auto peer_status = PeerStatus(
-        layout.producer, impl_->peer_timeout,
-        impl_->next_peer_identity_probe_ns);
-    if (!peer_status) {
-      return peer_status;
-    }
-
-    const auto expected_epoch =
-        AtomicLoad(&layout.producer_cursor.data_epoch, __ATOMIC_ACQUIRE);
-    const auto rechecked_tail =
-        AtomicLoad(&layout.consumer_cursor.tail, __ATOMIC_RELAXED);
-    const auto rechecked_head =
-        AtomicLoad(&layout.producer_cursor.head, __ATOMIC_ACQUIRE);
-    if (rechecked_tail != rechecked_head) {
+      std::uint64_t spun_tail = tail;
+      if (SpinForData(
+              layout, impl_->active_spin_count,
+              &spun_tail)) {
+        continue;
+      }
+      const auto peer_status = PeerStatus(
+          layout.producer, impl_->peer_timeout,
+          impl_->next_peer_identity_probe_ns);
+      if (!peer_status) {
+        return peer_status;
+      }
+      const auto expected_epoch = AtomicLoad(
+          &layout.producer_cursor.data_epoch,
+          __ATOMIC_ACQUIRE);
+      const auto rechecked_tail = AtomicLoad(
+          &layout.consumer_cursor.tail, __ATOMIC_RELAXED);
+      const auto rechecked_head = AtomicLoad(
+          &layout.producer_cursor.head, __ATOMIC_ACQUIRE);
+      if (rechecked_tail != rechecked_head) {
+        continue;
+      }
+      const auto wait = FutexWait(
+          &layout.producer_cursor.data_epoch,
+          expected_epoch,
+          ProbeDeadline(deadline, impl_->peer_timeout));
+      if (wait.result == FutexWaitResult::Error) {
+        return Status(
+            StatusCode::IoError,
+            "futex wait for published chunk failed",
+            wait.error);
+      }
       continue;
     }
 
-    if (impl_->closed.load(std::memory_order_acquire)) {
-      return Status(StatusCode::Closed);
+    const auto recovery = impl_->RecoverConsumerTailSlot();
+    if (!recovery) {
+      return recovery;
     }
-    const auto wait =
-        FutexWait(&layout.producer_cursor.data_epoch, expected_epoch,
-                  ProbeDeadline(deadline, impl_->peer_timeout));
-    if (wait.result == FutexWaitResult::TimedOut) {
+    if (AtomicLoad(&layout.consumer_cursor.tail,
+                   __ATOMIC_RELAXED) != tail) {
       continue;
     }
-    if (wait.result == FutexWaitResult::Error) {
-      return Status(StatusCode::IoError, "futex wait for queue data failed",
-                    wait.error);
+    auto& slot = *SlotAt(&layout, tail);
+    if (LoadSlotState(slot) != SlotState::Published) {
+      continue;
     }
-  }
+    if (slot.sequence != tail + 1U ||
+        slot.length > layout.queue.max_message_size) {
+      AtomicFetchAdd(
+          &layout.consumer_cursor.corrupt_messages,
+          std::uint64_t{1}, __ATOMIC_RELAXED);
+      return Status(
+          StatusCode::CorruptData,
+          "published chunk metadata is invalid");
+    }
+    if (!TransitionSlot(
+            slot, SlotState::Published,
+            SlotState::ConsumerTaking)) {
+      continue;
+    }
 
-  if (impl_->closed.load(std::memory_order_acquire)) {
-    return Status(StatusCode::Closed);
+    const auto owner_generation =
+        NextNonZero(slot.owner_generation);
+    slot.owner_generation = owner_generation;
+    slot.owner_pid = static_cast<std::int32_t>(::getpid());
+    slot.owner_role =
+        static_cast<std::uint32_t>(SlotOwnerRole::Consumer);
+    slot.owner_process_start_ticks =
+        impl_->process_start_ticks;
+    slot.owner_role_token = impl_->role_token;
+    slot.owner_channel_generation = current_generation;
+    AtomicStore(&slot.state,
+                StateValue(SlotState::LoanedToConsumer),
+                __ATOMIC_RELEASE);
+
+    AtomicFetchAdd(
+        &layout.consumer_cursor.zero_copy_takes,
+        std::uint64_t{1}, __ATOMIC_RELAXED);
+    AtomicFetchAdd(
+        &layout.consumer.operation_sequence,
+        std::uint64_t{1}, __ATOMIC_RELAXED);
+    return SubscriberSample(
+        impl_, &slot, slot.length, tail,
+        slot.chunk_generation, owner_generation,
+        impl_->role_token, current_generation);
   }
-  SlotHeader* slot = SlotAt(&layout, tail);
-  const std::uint32_t length = slot->length;
-  if (length > layout.queue.max_message_size) {
-    AtomicFetchAdd(&layout.consumer_cursor.corrupt_messages,
-                   std::uint64_t{1}, __ATOMIC_RELAXED);
-    return Status(StatusCode::CorruptData,
-                  "slot length exceeds configured maximum");
+}
+
+Status SharedMemoryTransport::Send(std::span<const std::byte> message,
+                                   SendOptions options) {
+  auto loan_result = Loan(message.size(), options);
+  if (!loan_result) {
+    return loan_result.status();
   }
-  if (destination.size() < length) {
+  auto loan = std::move(loan_result).take_value();
+  auto destination = loan.Data();
+  if (!message.empty()) {
+    std::memcpy(
+        destination.data(), message.data(), message.size());
+  }
+  return loan.Publish();
+
+}
+
+Result<std::size_t> SharedMemoryTransport::Receive(
+    std::span<std::byte> destination, Deadline deadline) {
+  auto sample_result = Take(deadline);
+  if (!sample_result) {
+    return sample_result.status();
+  }
+  auto sample = std::move(sample_result).take_value();
+  const auto loaned_payload = sample.Data();
+  if (destination.size() < loaned_payload.size()) {
+    const auto requeue_status = sample.Requeue();
+    if (!requeue_status) {
+      return requeue_status;
+    }
     return Status(StatusCode::BufferTooSmall);
   }
-
-  const auto* payload =
-      reinterpret_cast<const std::byte*>(slot) + sizeof(SlotHeader);
-  if (length != 0U) {
-    std::memcpy(destination.data(), payload, length);
+  if (!loaned_payload.empty()) {
+    std::memcpy(
+        destination.data(), loaned_payload.data(),
+        loaned_payload.size());
   }
+  const auto received_length = loaned_payload.size();
+  const auto release_status = sample.Release();
+  if (!release_status) {
+    return release_status;
+  }
+  return received_length;
 
-  AtomicStore(&layout.consumer_cursor.tail, tail + 1U, __ATOMIC_RELEASE);
-  AtomicFetchAdd(&layout.consumer_cursor.space_epoch, std::uint32_t{1},
-                 __ATOMIC_RELEASE);
-  FutexWake(&layout.consumer_cursor.space_epoch);
-  AtomicFetchAdd(&layout.consumer_cursor.received_messages, std::uint64_t{1},
-                 __ATOMIC_RELAXED);
-  AtomicFetchAdd(&layout.consumer.operation_sequence, std::uint64_t{1},
-                 __ATOMIC_RELAXED);
-  return static_cast<std::size_t>(length);
 }
 
 TransportStats SharedMemoryTransport::Stats() const noexcept {
@@ -1260,6 +1907,24 @@ TransportStats SharedMemoryTransport::Stats() const noexcept {
       AtomicLoad(&layout.consumer_cursor.timeout_count, __ATOMIC_RELAXED);
   stats.corrupt_messages =
       AtomicLoad(&layout.consumer_cursor.corrupt_messages, __ATOMIC_RELAXED);
+  stats.zero_copy_loans =
+      AtomicLoad(&layout.producer_cursor.zero_copy_loans,
+                 __ATOMIC_RELAXED);
+  stats.zero_copy_publishes =
+      AtomicLoad(&layout.producer_cursor.zero_copy_publishes,
+                 __ATOMIC_RELAXED);
+  stats.zero_copy_takes =
+      AtomicLoad(&layout.consumer_cursor.zero_copy_takes,
+                 __ATOMIC_RELAXED);
+  stats.zero_copy_releases =
+      AtomicLoad(&layout.consumer_cursor.zero_copy_releases,
+                 __ATOMIC_RELAXED);
+  stats.producer_loan_reclaims =
+      AtomicLoad(&layout.producer_cursor.reclaimed_loans,
+                 __ATOMIC_RELAXED);
+  stats.consumer_loan_reclaims =
+      AtomicLoad(&layout.consumer_cursor.reclaimed_loans,
+                 __ATOMIC_RELAXED);
   return stats;
 }
 

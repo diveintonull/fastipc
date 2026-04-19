@@ -92,6 +92,44 @@ if(BUILD_TESTING AND FASTIPC_BUILD_TESTS)
     add_test(NAME fastipc.transport COMMAND fastipc_tests)
 
     add_executable(
+        fastipc_zero_copy_tests
+        tests/zero_copy_test.cpp)
+    target_link_libraries(
+        fastipc_zero_copy_tests
+        PRIVATE FastIPC::fastipc Threads::Threads)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            fastipc_zero_copy_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+                -Wconversion
+                -Wsign-conversion)
+    endif()
+    add_test(NAME fastipc.zero_copy COMMAND fastipc_zero_copy_tests)
+    add_test(NAME fastipc.zero_copy.no_allocation
+             COMMAND fastipc_zero_copy_tests
+                     --case steady_state_allocation)
+    add_test(NAME fastipc.fault.producer_loan_crash
+             COMMAND fastipc_zero_copy_tests --case producer_loan_crash)
+    add_test(NAME fastipc.fault.consumer_sample_crash
+             COMMAND fastipc_zero_copy_tests --case consumer_sample_crash)
+    add_test(NAME fastipc.fault.outstanding_handle_close
+             COMMAND fastipc_zero_copy_tests --case outstanding_handle_close)
+    add_test(NAME fastipc.fault.producer_paused_takeover
+             COMMAND fastipc_zero_copy_tests --case producer_paused_takeover)
+    add_test(NAME fastipc.fault.consumer_paused_takeover
+             COMMAND fastipc_zero_copy_tests --case consumer_paused_takeover)
+    set_tests_properties(
+        fastipc.fault.producer_loan_crash
+        fastipc.fault.consumer_sample_crash
+        fastipc.fault.outstanding_handle_close
+        fastipc.fault.producer_paused_takeover
+        fastipc.fault.consumer_paused_takeover
+        PROPERTIES LABELS fault)
+
+    add_executable(
         fastipc_uds_tests
         tests/unix_domain_socket_test.cpp)
     target_link_libraries(

@@ -13,14 +13,18 @@
 
 namespace {
 
+using fastipc::benchmark::AccessPattern;
 using fastipc::benchmark::CaseConfig;
 using fastipc::benchmark::TransportKind;
 
 struct Options {
   std::vector<TransportKind> transports{
-      TransportKind::SharedMemory,
+      TransportKind::FastIpcCopy,
+      TransportKind::FastIpcZeroCopy,
       TransportKind::UnixDomainSocket,
       TransportKind::Pipe};
+  std::vector<AccessPattern> access_patterns{
+      AccessPattern::TransportOnly, AccessPattern::TouchMemory};
   std::vector<std::size_t> payload_sizes =
       fastipc::benchmark::RequiredPayloadSizes();
   std::optional<std::size_t> iterations;
@@ -66,9 +70,10 @@ std::string_view OptionValue(std::string_view argument,
 void PrintHelp() {
   std::cout
       << "Usage: fastipc_benchmark [options]\n"
-      << "  --self-test                 run 3 transports x 2 sizes\n"
-      << "  --transport=NAME            shared_memory, "
+      << "  --self-test                 run 4 transports x 2 modes x 2 sizes\n"
+      << "  --transport=NAME            fastipc_copy, fastipc_zero_copy, "
          "unix_domain_socket, pipe, or all\n"
+      << "  --access=NAME               transport_only, touch_memory, or all\n"
       << "  --payload=BYTES             one size; K and M suffixes work\n"
       << "  --iterations=COUNT          measured round trips per case\n"
       << "  --warmup=COUNT              warmup round trips per case\n"
@@ -93,7 +98,8 @@ Options ParseOptions(int argc, char** argv) {
         !value.empty()) {
       if (value == "all") {
         options.transports = {
-            TransportKind::SharedMemory,
+            TransportKind::FastIpcCopy,
+            TransportKind::FastIpcZeroCopy,
             TransportKind::UnixDomainSocket,
             TransportKind::Pipe};
       } else {
@@ -104,6 +110,24 @@ Options ParseOptions(int argc, char** argv) {
               "unknown transport: " + std::string(value));
         }
         options.transports = {*transport};
+      }
+      continue;
+    }
+
+    if (const auto value = OptionValue(argument, "--access=");
+        !value.empty()) {
+      if (value == "all") {
+        options.access_patterns = {
+            AccessPattern::TransportOnly,
+            AccessPattern::TouchMemory};
+      } else {
+        const auto access_pattern =
+            fastipc::benchmark::ParseAccessPattern(value);
+        if (!access_pattern) {
+          throw std::invalid_argument(
+              "unknown access pattern: " + std::string(value));
+        }
+        options.access_patterns = {*access_pattern};
       }
       continue;
     }
@@ -133,9 +157,12 @@ Options ParseOptions(int argc, char** argv) {
 
   if (options.self_test) {
     options.transports = {
-        TransportKind::SharedMemory,
+        TransportKind::FastIpcCopy,
+        TransportKind::FastIpcZeroCopy,
         TransportKind::UnixDomainSocket,
         TransportKind::Pipe};
+    options.access_patterns = {
+        AccessPattern::TransportOnly, AccessPattern::TouchMemory};
     options.payload_sizes = {64U, 1024U * 1024U};
     options.iterations = 3U;
     options.warmup_iterations = 1U;
@@ -154,29 +181,34 @@ int main(int argc, char** argv) {
 
     std::uint64_t case_id = 1U;
     for (const auto transport : options.transports) {
-      for (const auto payload_bytes : options.payload_sizes) {
-        CaseConfig config;
-        config.transport = transport;
-        config.payload_bytes = payload_bytes;
-        config.iterations =
-            options.iterations.value_or(
-                fastipc::benchmark::DefaultIterations(payload_bytes));
-        config.warmup_iterations =
-            options.warmup_iterations.value_or(
-                fastipc::benchmark::DefaultWarmupIterations(
-                    config.iterations));
-        config.case_id = case_id++;
+      for (const auto access_pattern : options.access_patterns) {
+        for (const auto payload_bytes : options.payload_sizes) {
+          CaseConfig config;
+          config.transport = transport;
+          config.access_pattern = access_pattern;
+          config.payload_bytes = payload_bytes;
+          config.iterations =
+              options.iterations.value_or(
+                  fastipc::benchmark::DefaultIterations(payload_bytes));
+          config.warmup_iterations =
+              options.warmup_iterations.value_or(
+                  fastipc::benchmark::DefaultWarmupIterations(
+                      config.iterations));
+          config.case_id = case_id++;
 
-        auto result = fastipc::benchmark::RunCase(config);
-        if (!result) {
-          std::cerr << "benchmark case failed: transport="
-                    << fastipc::benchmark::TransportName(transport)
-                    << " payload=" << payload_bytes << " status="
-                    << result.status().ToString() << '\n';
-          return 1;
+          auto result = fastipc::benchmark::RunCase(config);
+          if (!result) {
+            std::cerr << "benchmark case failed: transport="
+                      << fastipc::benchmark::TransportName(transport)
+                      << " access="
+                      << fastipc::benchmark::AccessPatternName(access_pattern)
+                      << " payload=" << payload_bytes << " status="
+                      << result.status().ToString() << '\n';
+            return 1;
+          }
+          std::cout << fastipc::benchmark::ToJson(result.value())
+                    << std::endl;
         }
-        std::cout << fastipc::benchmark::ToJson(result.value())
-                  << std::endl;
       }
     }
     return 0;

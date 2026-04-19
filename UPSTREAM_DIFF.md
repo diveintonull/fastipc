@@ -49,9 +49,9 @@
 | --- | --- | --- | --- |
 | Public API | concrete stream/queue class | typed `Transport`、`Status`、`Result`、`Deadline`、两种 adapter | `include/fastipc/` |
 | Mapping lifecycle | create 前 unlink 与 host-specific wrapper | Linux creator/open validation、mode 0600、size check、initialization election | `src/shared_memory_transport.cpp` |
-| Shared layout | 无 identity/version 的 host-native field | magic、1.1 version、endian marker、byte size、generation、endpoint、epoch、isolated cursor | `src/shared_memory_layout.hpp` |
-| Queue algorithm | lock-serialized side + shared count | 不含 data-plane CAS 的 SPSC single-writer head/tail publication | `Send`、`Receive` |
-| Memory ordering | 部分 atomic，未做 cross-process audit | per-field release/acquire proof 与 lock-free width assertion | `docs/memory-model.md` |
+| Shared layout | 无 identity/version 的 host-native field | magic、2.0 version、endian marker、byte size、generation、endpoint、epoch、isolated cursor，以及逐槽 generation/owner/state tag | `src/shared_memory_layout.hpp` |
+| Queue algorithm | lock-serialized side + shared count | SPSC ring；槽位 ownership 由状态 CAS 转移，head/tail 只用精确 expected-cursor CAS 单调发布 | `Loan`、`Publish`、`Take`、`Release` |
+| Memory ordering | 部分 atomic，未做 cross-process audit | 逐字段与逐状态 release/acquire 证明、精确游标 CAS，以及 lock-free width assertion | `docs/memory-model.md` |
 | Waiting | yield/spin 或立即 false | bounded active spin、epoch futex wait、predicate recheck、monotonic absolute deadline | futex helper、`Send`、`Receive` |
 | Backpressure | 立即 boolean failure | `Block`、deadline-bounded `Timeout`、immediate `Drop`、typed counter | `transport.hpp`、`Send` |
 | Shutdown lifetime | 无 blocked-operation drain contract | `Close` 标记 closed、wake 两个 epoch、drain active operation lease，最后释放 role/mapping | `OperationLease`、`Impl::Close`、regression |

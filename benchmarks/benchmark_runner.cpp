@@ -202,18 +202,108 @@ struct PipePair {
   }
 }
 
+void StoreSequence(std::span<std::byte> message,
+                   std::uint64_t sequence) noexcept {
+  std::memcpy(message.data(), &sequence, sizeof(sequence));
+}
+
+[[nodiscard]] std::uint64_t LoadSequence(
+    std::span<const std::byte> message) noexcept {
+  std::uint64_t sequence = 0U;
+  std::memcpy(&sequence, message.data(), sizeof(sequence));
+  return sequence;
+}
+
+[[nodiscard]] std::byte PayloadByte(
+    std::uint64_t sequence, std::size_t index) noexcept {
+  return static_cast<std::byte>(
+      (sequence + static_cast<std::uint64_t>(index) * 131U + 17U) %
+      251U);
+}
+
+void PreparePayload(std::span<std::byte> message,
+                    std::uint64_t sequence,
+                    AccessPattern access_pattern) noexcept {
+  StoreSequence(message, sequence);
+  if (access_pattern != AccessPattern::TouchMemory) {
+    return;
+  }
+  for (std::size_t index = sizeof(sequence);
+       index < message.size(); ++index) {
+    message[index] = PayloadByte(sequence, index);
+  }
+}
+
+[[nodiscard]] Result<std::uint64_t> ValidatePayload(
+    std::span<const std::byte> message,
+    AccessPattern access_pattern) {
+  if (message.size() < sizeof(std::uint64_t)) {
+    return Status(StatusCode::CorruptData,
+                  "benchmark message is shorter than its sequence");
+  }
+  const auto sequence = LoadSequence(message);
+  if (access_pattern == AccessPattern::TouchMemory) {
+    for (std::size_t index = sizeof(sequence);
+         index < message.size(); ++index) {
+      if (message[index] != PayloadByte(sequence, index)) {
+        return Status(StatusCode::CorruptData,
+                      "benchmark payload validation failed");
+      }
+    }
+  }
+  return sequence;
+}
+
 class Endpoint {
  public:
   virtual ~Endpoint() = default;
 
-  virtual Status Send(std::span<const std::byte> message,
-                      Deadline deadline) = 0;
-  virtual Result<std::size_t> Receive(
-      std::span<std::byte> destination, Deadline deadline) = 0;
+  virtual Status SendMessage(
+      std::size_t payload_bytes, std::uint64_t sequence,
+      AccessPattern access_pattern, Deadline deadline) = 0;
+  virtual Result<std::uint64_t> ReceiveMessage(
+      std::size_t payload_bytes, AccessPattern access_pattern,
+      Deadline deadline) = 0;
   virtual void Close() noexcept = 0;
 };
 
-class TransportEndpoint final : public Endpoint {
+class BufferedEndpoint : public Endpoint {
+ public:
+  Status SendMessage(
+      std::size_t payload_bytes, std::uint64_t sequence,
+      AccessPattern access_pattern, Deadline deadline) final {
+    outbound_buffer_.resize(payload_bytes);
+    PreparePayload(outbound_buffer_, sequence, access_pattern);
+    return SendBytes(outbound_buffer_, deadline);
+  }
+
+  Result<std::uint64_t> ReceiveMessage(
+      std::size_t payload_bytes, AccessPattern access_pattern,
+      Deadline deadline) final {
+    inbound_buffer_.resize(payload_bytes);
+    auto received = ReceiveBytes(inbound_buffer_, deadline);
+    if (!received) {
+      return received.status();
+    }
+    if (received.value() != payload_bytes) {
+      return Status(StatusCode::CorruptData,
+                    "benchmark endpoint received the wrong size");
+    }
+    return ValidatePayload(inbound_buffer_, access_pattern);
+  }
+
+ protected:
+  virtual Status SendBytes(
+      std::span<const std::byte> message, Deadline deadline) = 0;
+  virtual Result<std::size_t> ReceiveBytes(
+      std::span<std::byte> destination, Deadline deadline) = 0;
+
+ private:
+  std::vector<std::byte> outbound_buffer_;
+  std::vector<std::byte> inbound_buffer_;
+};
+
+class TransportEndpoint final : public BufferedEndpoint {
  public:
   TransportEndpoint(std::shared_ptr<Transport> outbound,
                     std::shared_ptr<Transport> inbound)
@@ -235,19 +325,6 @@ class TransportEndpoint final : public Endpoint {
         std::shared_ptr<Transport>(std::move(inbound)));
   }
 
-  Status Send(std::span<const std::byte> message,
-              Deadline deadline) override {
-    return outbound_->Send(
-        message,
-        SendOptions{BackpressurePolicy::Block, deadline});
-  }
-
-  Result<std::size_t> Receive(
-      std::span<std::byte> destination,
-      Deadline deadline) override {
-    return inbound_->Receive(destination, deadline);
-  }
-
   void Close() noexcept override {
     outbound_->Close();
     if (inbound_.get() != outbound_.get()) {
@@ -256,18 +333,98 @@ class TransportEndpoint final : public Endpoint {
   }
 
  private:
+  Status SendBytes(std::span<const std::byte> message,
+                   Deadline deadline) override {
+    return outbound_->Send(
+        message,
+        SendOptions{BackpressurePolicy::Block, deadline});
+  }
+
+  Result<std::size_t> ReceiveBytes(
+      std::span<std::byte> destination,
+      Deadline deadline) override {
+    return inbound_->Receive(destination, deadline);
+  }
+
   std::shared_ptr<Transport> outbound_;
   std::shared_ptr<Transport> inbound_;
 };
 
-class PipeEndpoint final : public Endpoint {
+class ZeroCopyEndpoint final : public Endpoint {
+ public:
+  ZeroCopyEndpoint(
+      std::unique_ptr<SharedMemoryTransport> outbound,
+      std::unique_ptr<SharedMemoryTransport> inbound)
+      : outbound_(std::move(outbound)),
+        inbound_(std::move(inbound)) {}
+
+  [[nodiscard]] static std::unique_ptr<Endpoint> Split(
+      std::unique_ptr<SharedMemoryTransport> outbound,
+      std::unique_ptr<SharedMemoryTransport> inbound) {
+    return std::make_unique<ZeroCopyEndpoint>(
+        std::move(outbound), std::move(inbound));
+  }
+
+  Status SendMessage(
+      std::size_t payload_bytes, std::uint64_t sequence,
+      AccessPattern access_pattern, Deadline deadline) override {
+    auto loan_result = outbound_->Loan(
+        payload_bytes,
+        SendOptions{BackpressurePolicy::Block, deadline});
+    if (!loan_result) {
+      return loan_result.status();
+    }
+    auto loan = std::move(loan_result).take_value();
+    PreparePayload(loan.Data(), sequence, access_pattern);
+    return loan.Publish();
+  }
+
+  Result<std::uint64_t> ReceiveMessage(
+      std::size_t payload_bytes, AccessPattern access_pattern,
+      Deadline deadline) override {
+    auto sample_result = inbound_->Take(deadline);
+    if (!sample_result) {
+      return sample_result.status();
+    }
+    auto sample = std::move(sample_result).take_value();
+    if (sample.size() != payload_bytes) {
+      static_cast<void>(sample.Release());
+      return Status(StatusCode::CorruptData,
+                    "zero-copy endpoint received the wrong size");
+    }
+    auto validation =
+        ValidatePayload(sample.Data(), access_pattern);
+    const auto release = sample.Release();
+    if (!release) {
+      return release;
+    }
+    return validation;
+  }
+
+  void Close() noexcept override {
+    outbound_->Close();
+    inbound_->Close();
+  }
+
+ private:
+  std::unique_ptr<SharedMemoryTransport> outbound_;
+  std::unique_ptr<SharedMemoryTransport> inbound_;
+};
+
+class PipeEndpoint final : public BufferedEndpoint {
  public:
   PipeEndpoint(UniqueFd write_end, UniqueFd read_end)
       : write_end_(std::move(write_end)),
         read_end_(std::move(read_end)) {}
 
-  Status Send(std::span<const std::byte> message,
-              Deadline deadline) override {
+  void Close() noexcept override {
+    write_end_.Reset();
+    read_end_.Reset();
+  }
+
+ private:
+  Status SendBytes(std::span<const std::byte> message,
+                   Deadline deadline) override {
     std::size_t offset = 0U;
     while (offset < message.size()) {
       const ssize_t written =
@@ -300,7 +457,7 @@ class PipeEndpoint final : public Endpoint {
     return Status::Ok();
   }
 
-  Result<std::size_t> Receive(
+  Result<std::size_t> ReceiveBytes(
       std::span<std::byte> destination,
       Deadline deadline) override {
     std::size_t offset = 0U;
@@ -333,12 +490,6 @@ class PipeEndpoint final : public Endpoint {
     return destination.size();
   }
 
-  void Close() noexcept override {
-    write_end_.Reset();
-    read_end_.Reset();
-  }
-
- private:
   UniqueFd write_end_;
   UniqueFd read_end_;
 };
@@ -389,21 +540,18 @@ struct ChildMetrics {
 
 [[nodiscard]] Status EchoIterations(
     Endpoint& endpoint, std::size_t payload_bytes,
-    std::size_t iterations,
+    std::size_t iterations, AccessPattern access_pattern,
     std::chrono::milliseconds operation_timeout) {
-  std::vector<std::byte> message(payload_bytes);
   for (std::size_t iteration = 0U;
        iteration < iterations; ++iteration) {
     const auto deadline = Deadline::After(operation_timeout);
-    auto received = endpoint.Receive(message, deadline);
+    auto received = endpoint.ReceiveMessage(
+        payload_bytes, access_pattern, deadline);
     if (!received) {
       return received.status();
     }
-    if (received.value() != payload_bytes) {
-      return Status(StatusCode::CorruptData,
-                    "benchmark child received the wrong size");
-    }
-    const auto sent = endpoint.Send(message, deadline);
+    const auto sent = endpoint.SendMessage(
+        payload_bytes, received.value(), access_pattern, deadline);
     if (!sent) {
       return sent;
     }
@@ -417,6 +565,7 @@ struct ChildMetrics {
   const auto warmup =
       EchoIterations(endpoint, config.payload_bytes,
                      config.warmup_iterations,
+                     config.access_pattern,
                      config.operation_timeout);
   if (!warmup) {
     return 20;
@@ -431,6 +580,7 @@ struct ChildMetrics {
   const auto measured =
       EchoIterations(endpoint, config.payload_bytes,
                      config.iterations,
+                     config.access_pattern,
                      config.operation_timeout);
   if (!measured) {
     return 22;
@@ -450,38 +600,26 @@ struct ChildMetrics {
   return 0;
 }
 
-void StoreSequence(std::span<std::byte> message,
-                   std::uint64_t sequence) noexcept {
-  std::memcpy(message.data(), &sequence, sizeof(sequence));
-}
-
-[[nodiscard]] std::uint64_t LoadSequence(
-    std::span<const std::byte> message) noexcept {
-  std::uint64_t sequence = 0U;
-  std::memcpy(&sequence, message.data(), sizeof(sequence));
-  return sequence;
-}
-
 [[nodiscard]] Status RoundTrip(
-    Endpoint& endpoint, std::vector<std::byte>* message,
-    std::vector<std::byte>* response, std::uint64_t sequence,
+    Endpoint& endpoint, std::size_t payload_bytes,
+    AccessPattern access_pattern, std::uint64_t sequence,
     std::chrono::milliseconds operation_timeout,
     std::chrono::nanoseconds* elapsed) {
-  StoreSequence(*message, sequence);
   const auto deadline = Deadline::After(operation_timeout);
   const auto started =
       elapsed == nullptr ? Clock::time_point{} : Clock::now();
 
-  const auto sent = endpoint.Send(*message, deadline);
+  const auto sent = endpoint.SendMessage(
+      payload_bytes, sequence, access_pattern, deadline);
   if (!sent) {
     return sent;
   }
-  auto received = endpoint.Receive(*response, deadline);
+  auto received = endpoint.ReceiveMessage(
+      payload_bytes, access_pattern, deadline);
   if (!received) {
     return received.status();
   }
-  if (received.value() != message->size() ||
-      LoadSequence(*response) != sequence) {
+  if (received.value() != sequence) {
     return Status(StatusCode::CorruptData,
                   "benchmark echo validation failed");
   }
@@ -513,9 +651,10 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
 
 [[nodiscard]] std::uint64_t NearestRank(
     const std::vector<std::uint64_t>& sorted,
-    std::size_t numerator) {
+    std::size_t numerator, std::size_t denominator) {
   const std::size_t rank =
-      (numerator * sorted.size() + 99U) / 100U;
+      (numerator * sorted.size() + denominator - 1U) /
+      denominator;
   return sorted[std::max<std::size_t>(1U, rank) - 1U];
 }
 
@@ -528,17 +667,11 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
     return status;
   };
 
-  std::vector<std::byte> message(config.payload_bytes);
-  for (std::size_t index = 0U; index < message.size(); ++index) {
-    message[index] =
-        static_cast<std::byte>((index * 131U + 17U) % 251U);
-  }
-  std::vector<std::byte> response(config.payload_bytes);
-
   for (std::size_t iteration = 0U;
        iteration < config.warmup_iterations; ++iteration) {
     const auto status =
-        RoundTrip(endpoint, &message, &response,
+        RoundTrip(endpoint, config.payload_bytes,
+                  config.access_pattern,
                   static_cast<std::uint64_t>(iteration + 1U),
                   config.operation_timeout, nullptr);
     if (!status) {
@@ -563,7 +696,8 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
         static_cast<std::uint64_t>(
             config.warmup_iterations + iteration + 1U);
     const auto status =
-        RoundTrip(endpoint, &message, &response, sequence,
+        RoundTrip(endpoint, config.payload_bytes,
+                  config.access_pattern, sequence,
                   config.operation_timeout, &elapsed);
     if (!status) {
       return fail(status);
@@ -578,11 +712,6 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
       CaptureSelfResource(&parent_after);
   if (!after_status) {
     return fail(after_status);
-  }
-  if (response != message) {
-    return fail(Status(
-        StatusCode::CorruptData,
-        "benchmark final payload comparison failed"));
   }
 
   ChildMetrics child_metrics;
@@ -633,8 +762,11 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
 
   BenchmarkResult result;
   result.transport = TransportName(config.transport);
-  if (config.transport == TransportKind::SharedMemory) {
-    result.transport_mode = "spsc_ring_futex";
+  if (config.transport == TransportKind::FastIpcCopy) {
+    result.transport_mode = "spsc_ring_copy_futex";
+  } else if (
+      config.transport == TransportKind::FastIpcZeroCopy) {
+    result.transport_mode = "spsc_ring_loan_futex";
   } else if (
       config.transport == TransportKind::UnixDomainSocket) {
     result.transport_mode =
@@ -644,6 +776,7 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
   } else {
     result.transport_mode = "dual_nonblocking_pipe";
   }
+  result.access_pattern = AccessPatternName(config.access_pattern);
   result.payload_bytes = config.payload_bytes;
   result.iterations = config.iterations;
   result.warmup_iterations = config.warmup_iterations;
@@ -656,13 +789,16 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
       payload_bytes /
       (static_cast<double>(kMebibyte) * wall_seconds);
   result.p50_us =
-      static_cast<double>(NearestRank(latencies_ns, 50U)) /
+      static_cast<double>(NearestRank(latencies_ns, 50U, 100U)) /
       1000.0;
   result.p95_us =
-      static_cast<double>(NearestRank(latencies_ns, 95U)) /
+      static_cast<double>(NearestRank(latencies_ns, 95U, 100U)) /
       1000.0;
   result.p99_us =
-      static_cast<double>(NearestRank(latencies_ns, 99U)) /
+      static_cast<double>(NearestRank(latencies_ns, 99U, 100U)) /
+      1000.0;
+  result.p99_9_us =
+      static_cast<double>(NearestRank(latencies_ns, 999U, 1000U)) /
       1000.0;
   result.user_cpu_ms = user_seconds * 1000.0;
   result.system_cpu_ms = system_seconds * 1000.0;
@@ -694,6 +830,19 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
   config.unlink_on_owner_close = true;
   config.peer_timeout = 10s;
   return config;
+}
+
+[[nodiscard]] std::unique_ptr<Endpoint> MakeSharedMemoryEndpoint(
+    TransportKind transport,
+    std::unique_ptr<SharedMemoryTransport> outbound,
+    std::unique_ptr<SharedMemoryTransport> inbound) {
+  if (transport == TransportKind::FastIpcZeroCopy) {
+    return ZeroCopyEndpoint::Split(
+        std::move(outbound), std::move(inbound));
+  }
+  return TransportEndpoint::Split(
+      std::unique_ptr<Transport>(std::move(outbound)),
+      std::unique_ptr<Transport>(std::move(inbound)));
 }
 
 [[nodiscard]] Result<BenchmarkResult> RunSharedMemoryCase(
@@ -767,11 +916,10 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
         return 32;
       }
 
-      auto endpoint = TransportEndpoint::Split(
-          std::unique_ptr<Transport>(
-              std::move(reply).take_value()),
-          std::unique_ptr<Transport>(
-              std::move(request).take_value()));
+      auto endpoint = MakeSharedMemoryEndpoint(
+          config.transport,
+          std::move(reply).take_value(),
+          std::move(request).take_value());
       const std::uint8_t ready = 1U;
       if (!WriteExactBlocking(
               child_to_parent.write_end.get(), &ready,
@@ -836,11 +984,10 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
     return reply.status();
   }
 
-  auto endpoint = TransportEndpoint::Split(
-      std::unique_ptr<Transport>(
-          std::move(request).take_value()),
-      std::unique_ptr<Transport>(
-          std::move(reply).take_value()));
+  auto endpoint = MakeSharedMemoryEndpoint(
+      config.transport,
+      std::move(request).take_value(),
+      std::move(reply).take_value());
   auto result = RunParentBenchmark(
       *endpoint, child, std::move(metrics.read_end), config);
   endpoint->Close();
@@ -1120,8 +1267,10 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
 
 const char* TransportName(TransportKind transport) noexcept {
   switch (transport) {
-    case TransportKind::SharedMemory:
-      return "shared_memory";
+    case TransportKind::FastIpcCopy:
+      return "fastipc_copy";
+    case TransportKind::FastIpcZeroCopy:
+      return "fastipc_zero_copy";
     case TransportKind::UnixDomainSocket:
       return "unix_domain_socket";
     case TransportKind::Pipe:
@@ -1130,16 +1279,43 @@ const char* TransportName(TransportKind transport) noexcept {
   return "unknown";
 }
 
+const char* AccessPatternName(
+    AccessPattern access_pattern) noexcept {
+  switch (access_pattern) {
+    case AccessPattern::TransportOnly:
+      return "transport_only";
+    case AccessPattern::TouchMemory:
+      return "touch_memory";
+  }
+  return "unknown";
+}
+
 std::optional<TransportKind> ParseTransport(
     std::string_view name) noexcept {
-  if (name == "shared_memory" || name == "shm") {
-    return TransportKind::SharedMemory;
+  if (name == "fastipc_copy" || name == "shared_memory" ||
+      name == "shm") {
+    return TransportKind::FastIpcCopy;
+  }
+  if (name == "fastipc_zero_copy" || name == "zero_copy" ||
+      name == "shm_zero_copy") {
+    return TransportKind::FastIpcZeroCopy;
   }
   if (name == "unix_domain_socket" || name == "uds") {
     return TransportKind::UnixDomainSocket;
   }
   if (name == "pipe") {
     return TransportKind::Pipe;
+  }
+  return std::nullopt;
+}
+
+std::optional<AccessPattern> ParseAccessPattern(
+    std::string_view name) noexcept {
+  if (name == "transport_only") {
+    return AccessPattern::TransportOnly;
+  }
+  if (name == "touch_memory") {
+    return AccessPattern::TouchMemory;
   }
   return std::nullopt;
 }
@@ -1185,7 +1361,8 @@ Result<BenchmarkResult> RunCase(const CaseConfig& config) {
   }
 
   switch (config.transport) {
-    case TransportKind::SharedMemory:
+    case TransportKind::FastIpcCopy:
+    case TransportKind::FastIpcZeroCopy:
       return RunSharedMemoryCase(config);
     case TransportKind::UnixDomainSocket:
       return RunUnixSocketCase(config);
@@ -1270,6 +1447,8 @@ std::string ToJson(const BenchmarkResult& result) {
          << JsonEscape(result.transport) << '"'
          << ",\"transport_mode\":\""
          << JsonEscape(result.transport_mode) << '"'
+         << ",\"access_pattern\":\""
+         << JsonEscape(result.access_pattern) << '"'
          << ",\"payload_bytes\":" << result.payload_bytes
          << ",\"iterations\":" << result.iterations
          << ",\"warmup_iterations\":"
@@ -1284,6 +1463,7 @@ std::string ToJson(const BenchmarkResult& result) {
          << ",\"p50_us\":" << result.p50_us
          << ",\"p95_us\":" << result.p95_us
          << ",\"p99_us\":" << result.p99_us
+         << ",\"p99_9_us\":" << result.p99_9_us
          << ",\"user_cpu_ms\":" << result.user_cpu_ms
          << ",\"system_cpu_ms\":" << result.system_cpu_ms
          << ",\"cpu_time_ms\":" << result.cpu_time_ms
