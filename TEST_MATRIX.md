@@ -80,3 +80,43 @@ setarch x86_64 -R env \
 ## CI
 
 [build_and_test.yml](.github/workflows/build_and_test.yml) 替代继承的上游 release/multi-platform workflow；后者引用了已移除的 `libsharedmemory` target。衍生项目只支持 Linux，当前以五个独立 Ubuntu job 运行 Debug、Release、ASan、UBSan、TSan。
+
+## 2026-08-21 零拷贝增量验证
+
+上面的 15 项矩阵是历史基线，原始日志保持不变。本节记录布局 2.0、借用 API 与崩溃恢复进入本地提交后的独立增量验证。
+
+| 字段 | 值 |
+| --- | --- |
+| Revision | `31aaf84a78decea72b641c37797bbad200b4bebd` |
+| 主机 / 内核 | WSL2 / `6.6.87.2-microsoft-standard-WSL2` |
+| 编译器 | GNU 13.3.0 |
+| 构建 | Ninja；Debug、Release、ASan、UBSan、TSan |
+| CTest 数量 | 每种配置 22 项，其中 `fault` 标签 17 项 |
+
+| 配置 | Sanitizer 参数 | 通过 | 失败 | 原始日志 |
+| --- | --- | ---: | ---: | --- |
+| Debug | 无 | 22 | 0 | [日志](tests/results/2026-08-21-debug-31aaf84.log) |
+| Release | 无 | 22 | 0 | [日志](tests/results/2026-08-21-release-31aaf84.log) |
+| ASan | `detect_leaks=1:halt_on_error=1` | 22 | 0 | [日志](tests/results/2026-08-21-asan-31aaf84.log) |
+| UBSan | `print_stacktrace=1:halt_on_error=1` | 22 | 0 | [日志](tests/results/2026-08-21-ubsan-31aaf84.log) |
+| TSan | `halt_on_error=1:second_deadlock_stack=1` | 22 | 0 | [日志](tests/results/2026-08-21-tsan-31aaf84.log) |
+
+完整增量矩阵为 110/110。编译阶段没有产生警告，五种配置都执行：
+
+- 原有共享内存、UDS 和 12 类基础故障测试；
+- 零拷贝聚合测试与稳态无普通堆分配探针；
+- producer loan crash、consumer sample crash、outstanding handle close；
+- producer/consumer paused takeover；
+- 四种 transport × 两种访问模式 × 两种载荷的基准冒烟测试。
+
+复现命令：
+
+```bash
+cmake -S projects/fastipc -B BUILD -G Ninja -DCMAKE_BUILD_TYPE=TYPE
+cmake --build BUILD
+ctest --test-dir BUILD --output-on-failure
+```
+
+ASan、UBSan、TSan 分别在 `CMAKE_CXX_FLAGS` 中加入对应 `-fsanitize=...` 与 `-fno-omit-frame-pointer`。本机 TSan 继续使用上文记录的 `setarch x86_64 -R` 包装；不使用该包装时 WSL2 会在测试代码运行前报告 shadow-memory mapping 冲突。
+
+该矩阵证明已自动化路径在本环境中通过，不宣称穷举所有跨进程交错，也不代替 native Linux、ARM 或真实机器人硬件验证。

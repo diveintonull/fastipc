@@ -1,0 +1,58 @@
+[OUTPUT]
+Internal ctest changing into directory: /home/phil/job/new/projects/fastipc/build-verify-debug
+
+[HANDLER_OUTPUT]
+Test project /home/phil/job/new/projects/fastipc/build-verify-debug
+
+      Start  1: fastipc.transport
+ 1/22 Test  #1: fastipc.transport ........................   Passed    1.36 sec
+      Start  2: fastipc.zero_copy
+ 2/22 Test  #2: fastipc.zero_copy ........................   Passed    0.22 sec
+      Start  3: fastipc.zero_copy.no_allocation
+ 3/22 Test  #3: fastipc.zero_copy.no_allocation ..........   Passed    0.00 sec
+      Start  4: fastipc.fault.producer_loan_crash
+ 4/22 Test  #4: fastipc.fault.producer_loan_crash ........   Passed    0.00 sec
+      Start  5: fastipc.fault.consumer_sample_crash
+ 5/22 Test  #5: fastipc.fault.consumer_sample_crash ......   Passed    0.00 sec
+      Start  6: fastipc.fault.outstanding_handle_close
+ 6/22 Test  #6: fastipc.fault.outstanding_handle_close ...   Passed    0.00 sec
+      Start  7: fastipc.fault.producer_paused_takeover
+ 7/22 Test  #7: fastipc.fault.producer_paused_takeover ...   Passed    0.09 sec
+      Start  8: fastipc.fault.consumer_paused_takeover
+ 8/22 Test  #8: fastipc.fault.consumer_paused_takeover ...   Passed    0.09 sec
+      Start  9: fastipc.uds
+ 9/22 Test  #9: fastipc.uds ..............................   Passed    0.09 sec
+      Start 10: fastipc.benchmark_smoke
+10/22 Test #10: fastipc.benchmark_smoke ..................   Passed    0.26 sec
+      Start 11: fastipc.fault.peer_missing
+11/22 Test #11: fastipc.fault.peer_missing ...............   Passed    0.00 sec
+      Start 12: fastipc.fault.producer_crash
+12/22 Test #12: fastipc.fault.producer_crash .............   Passed    0.00 sec
+      Start 13: fastipc.fault.consumer_crash
+13/22 Test #13: fastipc.fault.consumer_crash .............   Passed    0.00 sec
+      Start 14: fastipc.fault.restart
+14/22 Test #14: fastipc.fault.restart ....................   Passed    0.00 sec
+      Start 15: fastipc.fault.slow_consumer
+15/22 Test #15: fastipc.fault.slow_consumer ..............   Passed    0.02 sec
+      Start 16: fastipc.fault.timeout
+16/22 Test #16: fastipc.fault.timeout ....................   Passed    0.03 sec
+      Start 17: fastipc.fault.malformed_header
+17/22 Test #17: fastipc.fault.malformed_header ...........   Passed    0.00 sec
+      Start 18: fastipc.fault.version_mismatch
+18/22 Test #18: fastipc.fault.version_mismatch ...........   Passed    0.00 sec
+      Start 19: fastipc.fault.stale_shared_memory
+19/22 Test #19: fastipc.fault.stale_shared_memory ........   Passed    0.30 sec
+      Start 20: fastipc.fault.queue_full
+20/22 Test #20: fastipc.fault.queue_full .................   Passed    0.03 sec
+      Start 21: fastipc.fault.queue_empty
+21/22 Test #21: fastipc.fault.queue_empty ................   Passed    0.02 sec
+      Start 22: fastipc.fault.rapid_restart
+22/22 Test #22: fastipc.fault.rapid_restart ..............   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 22
+
+Label Time Summary:
+benchmark    =   0.26 sec*proc (1 test)
+fault        =   0.62 sec*proc (17 tests)
+
+Total Test time (real) =   2.57 sec

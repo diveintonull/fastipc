@@ -1,89 +1,90 @@
-# FastIPC 零拷贝 benchmark 结果
+# FastIPC 零拷贝基准测试结果
 
 ## 1. 证据
 
-本报告来自两次真实 Release run：
+本报告来自两次真实的 Release 运行：
 
-- [FastIPC Copy 原始 JSONL](benchmarks/results/2026-08-20-zero-copy-copy-wsl2-gcc13.jsonl)
-- [FastIPC Zero-copy 原始 JSONL](benchmarks/results/2026-08-20-zero-copy-loan-wsl2-gcc13.jsonl)
+- [FastIPC 复制路径原始 JSONL](benchmarks/results/2026-08-21-zero-copy-copy-wsl2-gcc13-31aaf84.jsonl)，SHA-256：`5dc9004eb969540e97e12aa00b5b6eee025797d809c78172004981923fa8b28e`
+- [FastIPC 零拷贝路径原始 JSONL](benchmarks/results/2026-08-21-zero-copy-loan-wsl2-gcc13-31aaf84.jsonl)，SHA-256：`0cbce97b1c44b394b9aaa59901c2f25e8a10884b94edd3979a7e859c055c7d70`
 
-每个文件包含 1 条 environment record 与 12 条 result：六种 payload × 两种访问模式。原始行保存 Msg/s、MiB/s、P50/P95/P99/P99.9、user/system CPU、CPU utilization、voluntary/involuntary context switch、parent/child peak RSS。
+每个文件包含 1 条环境记录与 12 条结果：六种载荷 × 两种访问模式。原始行保存 Msg/s、MiB/s、P50/P95/P99/P99.9、用户态/内核态 CPU、CPU 利用率、主动/被动上下文切换、父子进程峰值 RSS。
 
 ## 2. 环境与身份
 
 | 字段 | 值 |
 | --- | --- |
-| Host | `LAPTOP-NUKUM2JI`，WSL2 |
-| Kernel | `6.6.87.2-microsoft-standard-WSL2` |
+| 主机 | `LAPTOP-NUKUM2JI`，WSL2 |
+| 内核 | `6.6.87.2-microsoft-standard-WSL2` |
 | CPU | Intel Core Ultra 9 275HX，24 online logical CPU |
-| Compiler / build | GNU 13.3.0 / Release |
-| Protocol | cross-process、single-outstanding ping-pong；latency 为 RTT |
-| Clock / quantile | `steady_clock` / nearest-rank |
-| Embedded revision | `b03da127e629` |
+| 编译器 / 构建 | GNU 13.3.0 / Release |
+| 协议 | 跨进程、单未决消息 ping-pong；延迟为 RTT |
+| 时钟 / 分位数 | `steady_clock` / nearest-rank |
+| 嵌入版本 | `31aaf84a78de` |
+| UTC 时间 | 复制路径 `2026-08-20T20:22:47Z`；零拷贝路径 `2026-08-20T20:23:06Z` |
 
-embedded revision 是 benchmark 前的 parent HEAD，因为本项目遵循“先 benchmark、后 commit”的实现顺序；它不是对 dirty worktree 的虚假精确标识。代码进入本地 commit 后会再做一次 exact-revision refresh。当前结果对应的文件 SHA-256 会在 commit 前最终核对。
+两个二进制都在本地提交 `31aaf84a78de` 上重新配置并编译；原始环境记录中的版本与报告一致。运行时工作树中只有本任务范围外的用户文件变化，不影响 FastIPC 源码身份。
 
-## 3. 两种 workload
+## 3. 两种工作负载
 
 ### `transport_only`
 
-producer/consumer 只读写前 8 B sequence。copy API 仍必须搬运完整 payload；zero-copy 只测 ownership transfer、state transition 与 wakeup。这里报告的 MiB/s 是按逻辑 message size 推导的 transport capacity，不表示应用真实扫描了相同字节量。
+生产者和消费者只读写前 8 字节序号。复制 API 仍必须搬运完整载荷；零拷贝路径只测所有权转移、状态转换与唤醒。这里报告的 MiB/s 是按逻辑消息大小推导的传输容量，不表示应用真实扫描了相同字节量。
 
 ### `touch_memory`
 
-每个 sender 在目标存储中写完整 deterministic payload，每个 receiver 扫描并验证全部字节。zero-copy 直接在 loan/sample span 上执行；copy 路径还承担 API 强制的 slot 与应用 buffer 复制。
+每个发送方在目标存储中写入完整的确定性载荷，每个接收方扫描并验证全部字节。零拷贝直接在 loan/sample span 上执行；复制路径还承担 API 强制的槽位与应用缓冲区复制。
 
-## 4. Transport-only
+## 4. 仅传输模式
 
-| Payload | Copy Msg/s | Zero-copy Msg/s | Z/C | Copy P50 us | Zero P50 us | Copy P99 us | Zero P99 us |
+| 载荷 | Copy Msg/s | Zero-copy Msg/s | Z/C | Copy P50 us | Zero P50 us | Copy P99 us | Zero P99 us |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 B | 168,488 | 145,182 | 0.862x | 2.832 | 18.641 | 47.836 | 50.509 |
-| 256 B | 131,497 | 139,772 | 1.063x | 19.816 | 19.993 | 51.743 | 49.759 |
-| 1 KiB | 144,051 | 126,034 | 0.875x | 19.535 | 20.232 | 47.272 | 49.253 |
-| 4 KiB | 109,408 | 136,959 | 1.252x | 20.896 | 19.747 | 53.013 | 48.428 |
-| 64 KiB | 58,153 | 96,314 | 1.656x | 30.688 | 19.098 | 84.232 | 45.644 |
-| 1 MiB | 11,335 | 88,331 | 7.793x | 163.591 | 19.158 | 350.479 | 85.725 |
+| 64 B | 124,746 | 137,110 | 1.099x | 20.916 | 4.497 | 55.418 | 55.628 |
+| 256 B | 128,923 | 134,398 | 1.042x | 21.517 | 20.854 | 53.322 | 51.989 |
+| 1 KiB | 112,426 | 128,235 | 1.141x | 21.821 | 21.167 | 54.417 | 52.328 |
+| 4 KiB | 120,447 | 128,244 | 1.065x | 21.757 | 20.963 | 55.324 | 53.438 |
+| 64 KiB | 55,247 | 454,810 | 8.232x | 32.322 | 1.839 | 116.098 | 41.784 |
+| 1 MiB | 10,242 | 105,415 | 10.293x | 180.056 | 22.442 | 382.598 | 49.280 |
 
-1 MiB transport-only 的 88,331 logical Msg/s 或 86,261 MiB/s 不是“应用处理 86 GiB/s”的结论：payload 没被扫描。它准确说明 copy 路径随 payload 线性付费，而 loan/take ownership path 基本不随未触碰 payload 增长。
+1 MiB 仅传输模式的 105,415 逻辑 Msg/s 或约 103 GiB/s 不是“应用处理 103 GiB/s”的结论：载荷没有被扫描。它准确说明复制路径随载荷线性付费，而 loan/take 所有权路径基本不随未触碰载荷增长。
 
-64 B 和 1 KiB 的单次结果没有显示优势，且 64 B P50 受双峰调度/active-spin 行为影响明显。小消息不能用“零拷贝一定更快”概括。
+64 B 至 4 KiB 的提升为 4.2%–14.1%，但单次结果会受调度与主动自旋影响。小消息仍不能用“零拷贝一定更快”概括。
 
-## 5. Touch-memory
+## 5. 触碰内存模式
 
-| Payload | Copy Msg/s | Zero-copy Msg/s | Z/C | Copy P50 us | Zero P50 us | Copy P99 us | Zero P99 us |
+| 载荷 | Copy Msg/s | Zero-copy Msg/s | Z/C | Copy P50 us | Zero P50 us | Copy P99 us | Zero P99 us |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 B | 149,915 | 129,350 | 0.863x | 19.204 | 20.058 | 46.987 | 57.376 |
-| 256 B | 111,708 | 127,510 | 1.141x | 20.893 | 20.139 | 51.068 | 52.313 |
-| 1 KiB | 85,906 | 88,602 | 1.031x | 22.962 | 22.693 | 56.967 | 56.101 |
-| 4 KiB | 62,316 | 62,948 | 1.010x | 28.821 | 28.691 | 68.428 | 66.649 |
-| 64 KiB | 11,981 | 12,844 | 1.072x | 159.341 | 145.616 | 240.103 | 255.857 |
-| 1 MiB | 850 | 953 | 1.122x | 2,351.467 | 2,087.971 | 2,635.482 | 2,206.926 |
+| 64 B | 116,464 | 108,865 | 0.935x | 21.817 | 21.444 | 55.775 | 51.083 |
+| 256 B | 106,621 | 123,208 | 1.156x | 22.348 | 21.392 | 55.833 | 49.720 |
+| 1 KiB | 83,188 | 83,105 | 0.999x | 24.037 | 23.770 | 58.443 | 58.103 |
+| 4 KiB | 59,086 | 61,099 | 1.034x | 30.756 | 30.007 | 72.929 | 70.126 |
+| 64 KiB | 11,487 | 12,367 | 1.077x | 163.496 | 153.222 | 283.617 | 248.654 |
+| 1 MiB | 820 | 904 | 1.102x | 2,421.094 | 2,199.125 | 2,706.532 | 2,358.272 |
 
 在完整触碰内存时：
 
-- 1 MiB zero-copy Msg/s 高 12.2%，P50 RTT 低 11.2%，P99 低 16.3%；
-- 64 KiB Msg/s 高 7.2%、P50 低 8.6%，但 P99/P99.9 单次 run 更差；
-- 1–4 KiB 基本持平；
-- 64 B zero-copy 更慢约 13.7%。
+- 1 MiB 零拷贝 Msg/s 高 10.2%，P50 RTT 低 9.2%，P99 低 12.9%；
+- 64 KiB Msg/s 高 7.7%、P50 低 6.3%、P99 低 12.3%，但 P99.9 单次运行高 2.3%；
+- 1 KiB 基本持平，4 KiB 高 3.4%；
+- 256 B 高 15.6%，但 64 B 低 6.5%，说明小消息结果更易受调度噪声影响。
 
-这支持“零拷贝价值随 payload 与应用访问方式变化”，不支持 universal winner。
+这支持“零拷贝价值随载荷与应用访问方式变化”，不支持“零拷贝永远更快”。
 
-## 6. CPU、context switch 与 RSS
+## 6. CPU、上下文切换与 RSS
 
 所有原始字段均在 JSONL。解释规则：
 
-- CPU 是 parent + child measured-window `getrusage` delta，可能超过 100%；
-- context switch 是两个进程的 delta；
-- RSS 是 process-lifetime peak，不是 per-message allocation；
-- no-allocation 结论来自独立 CTest 的 warmed `operator new` probe，不由 RSS 推断。
+- CPU 是父子进程测量窗口内 `getrusage` 增量之和，可能超过 100%；
+- 上下文切换是两个进程的增量；
+- RSS 是进程生命周期峰值，不是逐消息分配；
+- 无分配结论来自独立 CTest 中预热后的 `operator new` 探针，不由 RSS 推断。
 
 ## 7. 限制
 
-- 每个 case 只有一次 run，未给置信区间；
-- WSL2 scheduler、频率与 host load 会造成抖动；
-- RTT 不是 one-way latency；
-- synchronous ping-pong 不代表 saturated pipeline；
-- `transport_only` 不触碰 payload；
-- 当前没有 CPU pinning、NUMA binding 或 realtime scheduling；
-- `INCOMPLETE`：iceoryx 同协议对照将在完整 comparative benchmark 阶段加入；若构建失败会保留失败日志；
+- 每个用例只有一次运行，未给置信区间；
+- WSL2 调度器、频率与主机负载会造成抖动；
+- RTT 不是单向延迟；
+- 同步 ping-pong 不代表饱和流水线；
+- `transport_only` 不触碰载荷；
+- 当前没有 CPU 绑核、NUMA 绑定或实时调度；
+- `INCOMPLETE`：iceoryx 同协议对照将在完整对比基准阶段加入；若构建失败会保留失败日志；
 - `INCOMPLETE`：native Linux 与目标机器人硬件复测。
