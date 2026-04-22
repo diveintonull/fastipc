@@ -48,6 +48,11 @@
 #define FASTIPC_SOURCE_REVISION "unknown"
 #endif
 
+#ifndef FASTIPC_ICEORYX_BASELINE_DETAIL
+#define FASTIPC_ICEORYX_BASELINE_DETAIL \
+  "iceoryx benchmark adapter is not available"
+#endif
+
 namespace fastipc::benchmark {
 namespace {
 
@@ -58,6 +63,7 @@ constexpr std::size_t kMebibyte = 1024U * 1024U;
 constexpr std::uint64_t kTargetTransferredBytes = 64U * kMebibyte;
 constexpr std::size_t kMinimumIterations = 100U;
 constexpr std::size_t kMaximumIterations = 20'000U;
+constexpr std::size_t kMaximumConfiguredIterations = 10'000'000U;
 
 class UniqueFd {
  public:
@@ -761,6 +767,9 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
       static_cast<double>(config.payload_bytes);
 
   BenchmarkResult result;
+  result.run_id = config.run_id;
+  result.case_id = config.case_id;
+  result.trial = config.trial;
   result.transport = TransportName(config.transport);
   if (config.transport == TransportKind::FastIpcCopy) {
     result.transport_mode = "spsc_ring_copy_futex";
@@ -780,6 +789,13 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
   result.payload_bytes = config.payload_bytes;
   result.iterations = config.iterations;
   result.warmup_iterations = config.warmup_iterations;
+  result.completed_round_trips =
+      static_cast<std::uint64_t>(config.iterations);
+  result.logical_messages =
+      static_cast<std::uint64_t>(config.iterations) * 2U;
+  result.payload_bytes_transferred =
+      result.logical_messages *
+      static_cast<std::uint64_t>(config.payload_bytes);
   result.wall_time_ms = wall_seconds * 1000.0;
   result.round_trips_per_second =
       static_cast<double>(config.iterations) / wall_seconds;
@@ -800,6 +816,8 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
   result.p99_9_us =
       static_cast<double>(NearestRank(latencies_ns, 999U, 1000U)) /
       1000.0;
+  result.max_us =
+      static_cast<double>(latencies_ns.back()) / 1000.0;
   result.user_cpu_ms = user_seconds * 1000.0;
   result.system_cpu_ms = system_seconds * 1000.0;
   result.cpu_time_ms = cpu_seconds * 1000.0;
@@ -1242,6 +1260,15 @@ void WaitForChild(pid_t child, rusage* usage = nullptr) noexcept {
   return buffer.data();
 }
 
+[[nodiscard]] std::string MakeRunId(
+    std::string_view timestamp_utc) {
+  std::ostringstream output;
+  output << timestamp_utc << '-' << ::getpid() << '-'
+         << Clock::now().time_since_epoch().count() << '-'
+         << FASTIPC_SOURCE_REVISION;
+  return output.str();
+}
+
 [[nodiscard]] std::string JsonEscape(
     std::string_view value) {
   std::string result;
@@ -1275,6 +1302,8 @@ const char* TransportName(TransportKind transport) noexcept {
       return "unix_domain_socket";
     case TransportKind::Pipe:
       return "pipe";
+    case TransportKind::Iceoryx:
+      return "iceoryx";
   }
   return "unknown";
 }
@@ -1306,6 +1335,9 @@ std::optional<TransportKind> ParseTransport(
   if (name == "pipe") {
     return TransportKind::Pipe;
   }
+  if (name == "iceoryx") {
+    return TransportKind::Iceoryx;
+  }
   return std::nullopt;
 }
 
@@ -1318,6 +1350,21 @@ std::optional<AccessPattern> ParseAccessPattern(
     return AccessPattern::TouchMemory;
   }
   return std::nullopt;
+}
+
+std::vector<TransportKind> RequiredTransports() {
+  return {TransportKind::FastIpcCopy,
+          TransportKind::FastIpcZeroCopy,
+          TransportKind::UnixDomainSocket,
+          TransportKind::Pipe,
+          TransportKind::Iceoryx};
+}
+
+std::vector<TransportKind> AvailableTransports() {
+  return {TransportKind::FastIpcCopy,
+          TransportKind::FastIpcZeroCopy,
+          TransportKind::UnixDomainSocket,
+          TransportKind::Pipe};
 }
 
 std::vector<std::size_t> RequiredPayloadSizes() {
@@ -1350,10 +1397,16 @@ Result<BenchmarkResult> RunCase(const CaseConfig& config) {
   if (config.payload_bytes < sizeof(std::uint64_t) ||
       config.payload_bytes >
           16U * static_cast<std::size_t>(kMebibyte) ||
-      config.iterations == 0U) {
+      config.iterations == 0U ||
+      config.iterations > kMaximumConfiguredIterations ||
+      config.warmup_iterations > kMaximumConfiguredIterations ||
+      config.operation_timeout <= std::chrono::milliseconds::zero() ||
+      config.run_id.empty() || config.case_id == 0U ||
+      config.trial == 0U) {
     return Status(
         StatusCode::InvalidArgument,
-        "benchmark payload must be 8 B..16 MiB and iterations positive");
+        "benchmark config requires a run/case/trial identity, positive "
+        "timeout, 8 B..16 MiB payload, and at most 10000000 iterations");
   }
   if (::signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
     return Status(StatusCode::IoError,
@@ -1368,6 +1421,9 @@ Result<BenchmarkResult> RunCase(const CaseConfig& config) {
       return RunUnixSocketCase(config);
     case TransportKind::Pipe:
       return RunPipeCase(config);
+    case TransportKind::Iceoryx:
+      return Status(StatusCode::Unsupported,
+                    FASTIPC_ICEORYX_BASELINE_DETAIL);
   }
   return Status(StatusCode::Unsupported,
                 "unknown benchmark transport");
@@ -1376,6 +1432,7 @@ Result<BenchmarkResult> RunCase(const CaseConfig& config) {
 Environment CaptureEnvironment() {
   Environment environment;
   environment.timestamp_utc = TimestampUtc();
+  environment.run_id = MakeRunId(environment.timestamp_utc);
 
   std::array<char, 256> hostname{};
   if (::gethostname(hostname.data(), hostname.size()) == 0) {
@@ -1407,9 +1464,50 @@ Environment CaptureEnvironment() {
   return environment;
 }
 
+std::vector<BaselineStatus> CaptureBaselineStatuses(
+    std::string_view run_id) {
+  std::vector<BaselineStatus> statuses;
+  statuses.reserve(RequiredTransports().size());
+  for (const auto transport : RequiredTransports()) {
+    BaselineStatus status;
+    status.run_id = run_id;
+    status.transport = TransportName(transport);
+    switch (transport) {
+      case TransportKind::FastIpcCopy:
+        status.available = true;
+        status.detail =
+            "built-in process-shared SPSC ring copy adapter with futex wakeup";
+        break;
+      case TransportKind::FastIpcZeroCopy:
+        status.available = true;
+        status.detail =
+            "built-in process-shared SPSC loan adapter with futex wakeup";
+        break;
+      case TransportKind::UnixDomainSocket:
+        status.available = true;
+        status.detail =
+            "built-in AF_UNIX SOCK_SEQPACKET adapter with sealed memfd for large payloads";
+        break;
+      case TransportKind::Pipe:
+        status.available = true;
+        status.detail = "built-in dual nonblocking Linux pipe adapter";
+        break;
+      case TransportKind::Iceoryx:
+        status.available = false;
+        status.detail = FASTIPC_ICEORYX_BASELINE_DETAIL;
+        break;
+    }
+    statuses.push_back(std::move(status));
+  }
+  return statuses;
+}
+
 std::string ToJson(const Environment& environment) {
   std::ostringstream output;
   output << "{\"type\":\"environment\""
+         << ",\"schema_version\":" << environment.schema_version
+         << ",\"run_id\":\""
+         << JsonEscape(environment.run_id) << '"'
          << ",\"timestamp_utc\":\""
          << JsonEscape(environment.timestamp_utc) << '"'
          << ",\"hostname\":\""
@@ -1433,8 +1531,21 @@ std::string ToJson(const Environment& environment) {
          << JsonEscape(environment.source_revision) << '"'
          << ",\"clock\":\"std::chrono::steady_clock\""
          << ",\"methodology\":\"cross-process single-outstanding "
-            "ping-pong; latency is RTT\""
+            "ping-pong, latency is RTT\""
          << ",\"quantile_method\":\"nearest-rank\""
+         << '}';
+  return output.str();
+}
+
+std::string ToJson(const BaselineStatus& status) {
+  std::ostringstream output;
+  output << "{\"type\":\"baseline_status\""
+         << ",\"schema_version\":" << status.schema_version
+         << ",\"run_id\":\"" << JsonEscape(status.run_id) << '"'
+         << ",\"transport\":\"" << JsonEscape(status.transport) << '"'
+         << ",\"available\":"
+         << (status.available ? "true" : "false")
+         << ",\"detail\":\"" << JsonEscape(status.detail) << '"'
          << '}';
   return output.str();
 }
@@ -1443,6 +1554,11 @@ std::string ToJson(const BenchmarkResult& result) {
   std::ostringstream output;
   output << std::fixed << std::setprecision(3)
          << "{\"type\":\"result\""
+         << ",\"schema_version\":" << result.schema_version
+         << ",\"run_id\":\"" << JsonEscape(result.run_id) << '"'
+         << ",\"case_id\":" << result.case_id
+         << ",\"trial\":" << result.trial
+         << ",\"status\":\"" << JsonEscape(result.status) << '"'
          << ",\"transport\":\""
          << JsonEscape(result.transport) << '"'
          << ",\"transport_mode\":\""
@@ -1453,6 +1569,11 @@ std::string ToJson(const BenchmarkResult& result) {
          << ",\"iterations\":" << result.iterations
          << ",\"warmup_iterations\":"
          << result.warmup_iterations
+         << ",\"completed_round_trips\":"
+         << result.completed_round_trips
+         << ",\"logical_messages\":" << result.logical_messages
+         << ",\"payload_bytes_transferred\":"
+         << result.payload_bytes_transferred
          << ",\"wall_time_ms\":" << result.wall_time_ms
          << ",\"round_trips_per_second\":"
          << result.round_trips_per_second
@@ -1464,6 +1585,7 @@ std::string ToJson(const BenchmarkResult& result) {
          << ",\"p95_us\":" << result.p95_us
          << ",\"p99_us\":" << result.p99_us
          << ",\"p99_9_us\":" << result.p99_9_us
+         << ",\"max_us\":" << result.max_us
          << ",\"user_cpu_ms\":" << result.user_cpu_ms
          << ",\"system_cpu_ms\":" << result.system_cpu_ms
          << ",\"cpu_time_ms\":" << result.cpu_time_ms

@@ -36,6 +36,17 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 if(FASTIPC_BUILD_BENCHMARKS)
+    find_package(iceoryx_posh CONFIG QUIET)
+    if(iceoryx_posh_FOUND)
+        set(
+            FASTIPC_ICEORYX_BASELINE_DETAIL
+            "iceoryx_posh was found, but the benchmark adapter is not implemented, so no measurement was emitted")
+    else()
+        set(
+            FASTIPC_ICEORYX_BASELINE_DETAIL
+            "iceoryx_posh CMake package was not found, so no measurement was emitted")
+    endif()
+
     set(FASTIPC_SOURCE_REVISION "unknown")
     find_package(Git QUIET)
     if(Git_FOUND)
@@ -63,7 +74,8 @@ if(FASTIPC_BUILD_BENCHMARKS)
         PRIVATE
             FASTIPC_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
             FASTIPC_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
-            FASTIPC_SOURCE_REVISION="${FASTIPC_SOURCE_REVISION}")
+            FASTIPC_SOURCE_REVISION="${FASTIPC_SOURCE_REVISION}"
+            FASTIPC_ICEORYX_BASELINE_DETAIL="${FASTIPC_ICEORYX_BASELINE_DETAIL}")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(
             fastipc_benchmark

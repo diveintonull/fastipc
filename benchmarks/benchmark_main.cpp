@@ -1,5 +1,6 @@
 #include "benchmark_runner.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cstdlib>
 #include <exception>
@@ -17,19 +18,20 @@ using fastipc::benchmark::AccessPattern;
 using fastipc::benchmark::CaseConfig;
 using fastipc::benchmark::TransportKind;
 
+constexpr std::size_t kMaximumTrials = 1000U;
+
 struct Options {
-  std::vector<TransportKind> transports{
-      TransportKind::FastIpcCopy,
-      TransportKind::FastIpcZeroCopy,
-      TransportKind::UnixDomainSocket,
-      TransportKind::Pipe};
+  std::vector<TransportKind> transports =
+      fastipc::benchmark::AvailableTransports();
   std::vector<AccessPattern> access_patterns{
       AccessPattern::TransportOnly, AccessPattern::TouchMemory};
   std::vector<std::size_t> payload_sizes =
       fastipc::benchmark::RequiredPayloadSizes();
   std::optional<std::size_t> iterations;
   std::optional<std::size_t> warmup_iterations;
+  std::size_t trials{1U};
   bool self_test{false};
+  bool strict_baselines{false};
 };
 
 std::size_t ParsePositiveSize(std::string_view text) {
@@ -72,11 +74,13 @@ void PrintHelp() {
       << "Usage: fastipc_benchmark [options]\n"
       << "  --self-test                 run 4 transports x 2 modes x 2 sizes\n"
       << "  --transport=NAME            fastipc_copy, fastipc_zero_copy, "
-         "unix_domain_socket, pipe, or all\n"
+         "unix_domain_socket, pipe, iceoryx, or all available\n"
       << "  --access=NAME               transport_only, touch_memory, or all\n"
       << "  --payload=BYTES             one size; K and M suffixes work\n"
       << "  --iterations=COUNT          measured round trips per case\n"
       << "  --warmup=COUNT              warmup round trips per case\n"
+      << "  --trials=COUNT              independent trials per logical case\n"
+      << "  --strict-baselines          return 3 if any required baseline is unavailable\n"
       << "  --help                      show this message\n";
 }
 
@@ -88,6 +92,10 @@ Options ParseOptions(int argc, char** argv) {
       options.self_test = true;
       continue;
     }
+    if (argument == "--strict-baselines") {
+      options.strict_baselines = true;
+      continue;
+    }
     if (argument == "--help") {
       PrintHelp();
       std::exit(0);
@@ -97,11 +105,8 @@ Options ParseOptions(int argc, char** argv) {
             OptionValue(argument, "--transport=");
         !value.empty()) {
       if (value == "all") {
-        options.transports = {
-            TransportKind::FastIpcCopy,
-            TransportKind::FastIpcZeroCopy,
-            TransportKind::UnixDomainSocket,
-            TransportKind::Pipe};
+        options.transports =
+            fastipc::benchmark::AvailableTransports();
       } else {
         const auto transport =
             fastipc::benchmark::ParseTransport(value);
@@ -151,21 +156,30 @@ Options ParseOptions(int argc, char** argv) {
       continue;
     }
 
+    if (const auto value = OptionValue(argument, "--trials=");
+        !value.empty()) {
+      options.trials = ParsePositiveSize(value);
+      if (options.trials > kMaximumTrials) {
+        throw std::invalid_argument(
+            "trials must not exceed 1000");
+      }
+      continue;
+    }
+
     throw std::invalid_argument(
         "unknown option: " + std::string(argument));
   }
 
   if (options.self_test) {
-    options.transports = {
-        TransportKind::FastIpcCopy,
-        TransportKind::FastIpcZeroCopy,
-        TransportKind::UnixDomainSocket,
-        TransportKind::Pipe};
+    options.transports =
+        fastipc::benchmark::AvailableTransports();
     options.access_patterns = {
         AccessPattern::TransportOnly, AccessPattern::TouchMemory};
     options.payload_sizes = {64U, 1024U * 1024U};
     options.iterations = 3U;
     options.warmup_iterations = 1U;
+    options.trials = 1U;
+    options.strict_baselines = false;
   }
   return options;
 }
@@ -174,44 +188,81 @@ Options ParseOptions(int argc, char** argv) {
 
 int main(int argc, char** argv) {
   try {
+    constexpr int unavailable_baseline_exit_code = 3;
     const auto options = ParseOptions(argc, argv);
-    std::cout << fastipc::benchmark::ToJson(
-                     fastipc::benchmark::CaptureEnvironment())
+    const auto environment =
+        fastipc::benchmark::CaptureEnvironment();
+    std::cout << fastipc::benchmark::ToJson(environment)
               << std::endl;
+
+    const auto baseline_statuses =
+        fastipc::benchmark::CaptureBaselineStatuses(
+            environment.run_id);
+    bool required_baseline_missing = false;
+    for (const auto& status : baseline_statuses) {
+      std::cout << fastipc::benchmark::ToJson(status)
+                << std::endl;
+      required_baseline_missing =
+          required_baseline_missing || !status.available;
+    }
+
+    if (std::find(options.transports.begin(),
+                  options.transports.end(),
+                  TransportKind::Iceoryx) !=
+        options.transports.end()) {
+      std::cerr
+          << "benchmark baseline unavailable: transport=iceoryx\n";
+      return unavailable_baseline_exit_code;
+    }
 
     std::uint64_t case_id = 1U;
     for (const auto transport : options.transports) {
       for (const auto access_pattern : options.access_patterns) {
         for (const auto payload_bytes : options.payload_sizes) {
-          CaseConfig config;
-          config.transport = transport;
-          config.access_pattern = access_pattern;
-          config.payload_bytes = payload_bytes;
-          config.iterations =
-              options.iterations.value_or(
-                  fastipc::benchmark::DefaultIterations(payload_bytes));
-          config.warmup_iterations =
-              options.warmup_iterations.value_or(
-                  fastipc::benchmark::DefaultWarmupIterations(
-                      config.iterations));
-          config.case_id = case_id++;
+          const std::uint64_t logical_case_id = case_id++;
+          for (std::size_t trial = 1U;
+               trial <= options.trials; ++trial) {
+            CaseConfig config;
+            config.run_id = environment.run_id;
+            config.transport = transport;
+            config.access_pattern = access_pattern;
+            config.payload_bytes = payload_bytes;
+            config.iterations =
+                options.iterations.value_or(
+                    fastipc::benchmark::DefaultIterations(
+                        payload_bytes));
+            config.warmup_iterations =
+                options.warmup_iterations.value_or(
+                    fastipc::benchmark::DefaultWarmupIterations(
+                        config.iterations));
+            config.case_id = logical_case_id;
+            config.trial = trial;
 
-          auto result = fastipc::benchmark::RunCase(config);
-          if (!result) {
-            std::cerr << "benchmark case failed: transport="
-                      << fastipc::benchmark::TransportName(transport)
-                      << " access="
-                      << fastipc::benchmark::AccessPatternName(access_pattern)
-                      << " payload=" << payload_bytes << " status="
-                      << result.status().ToString() << '\n';
-            return 1;
+            auto result = fastipc::benchmark::RunCase(config);
+            if (!result) {
+              std::cerr << "benchmark case failed: transport="
+                        << fastipc::benchmark::TransportName(
+                               transport)
+                        << " access="
+                        << fastipc::benchmark::AccessPatternName(
+                               access_pattern)
+                        << " payload=" << payload_bytes
+                        << " case_id=" << logical_case_id
+                        << " trial=" << trial << " status="
+                        << result.status().ToString() << '\n';
+              return 1;
+            }
+            std::cout
+                << fastipc::benchmark::ToJson(result.value())
+                << std::endl;
           }
-          std::cout << fastipc::benchmark::ToJson(result.value())
-                    << std::endl;
         }
       }
     }
-    return 0;
+    return options.strict_baselines &&
+                   required_baseline_missing
+               ? unavailable_baseline_exit_code
+               : 0;
   } catch (const std::exception& error) {
     std::cerr << "fastipc_benchmark: " << error.what() << '\n';
     return 2;

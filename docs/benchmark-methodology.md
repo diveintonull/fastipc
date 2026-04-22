@@ -12,8 +12,11 @@ benchmark 在一个可复现 cross-process protocol 下，比较 FastIPC copy、
 | `fastipc_zero_copy` | 同一 ring 与 futex protocol；`Loan`/`Take` 直接访问 slot payload |
 | `unix_domain_socket` | `SOCK_SEQPACKET`；64 KiB 内 inline，以上使用 sealed `memfd` + `SCM_RIGHTS` |
 | `pipe` | 两条 nonblocking pipe，每个方向一条 |
+| `iceoryx` | 只有依赖与专用 adapter 都真实可用时才测；否则只输出 `baseline_status` |
 
 payload：64 B、256 B、1 KiB、4 KiB、64 KiB、1 MiB。
+
+当前本机没有找到 `iceoryx_posh` CMake package，且本 revision 没有 iceoryx adapter，所以它被明确标记为 **INCOMPLETE / unavailable**。框架不会生成 0 throughput 或虚构结果；显式选择 `--transport=iceoryx` 返回 3。rigtorp SPSC 只适合作 queue microbenchmark，不进入跨进程 IPC 公平对比。
 
 ## 访问模式
 
@@ -54,7 +57,7 @@ warmup 不进入任何 metric：
 warmup = clamp(iterations / 20, 5, 100)
 ```
 
-command line 可覆盖二者。`--self-test` 在 4 种 transport、2 种访问模式、64 B/1 MiB 上各做 3 次 measured + 1 次 warmup，共产生 16 条 result，用于校验 harness/schema，不代表性能。
+command line 可覆盖二者。`--trials=N` 会对同一个逻辑 case 做 N 次独立 fork/setup/measurement；这些记录共享 `case_id`，`trial` 从 1 开始，runner 不挑最好值，也不在内部只保留平均值。`--self-test` 在 4 种可用 transport、2 种访问模式、64 B/1 MiB 上各做 3 次 measured + 1 次 warmup，共产生 16 条 result，用于校验 harness/schema，不代表性能。
 
 ## Timing 与 quantile
 
@@ -66,6 +69,8 @@ messages_per_second    = 2 * iterations / wall_seconds
 payload_mib_per_second = 2 * iterations * payload_bytes
                          / (MiB * wall_seconds)
 ```
+
+每条 result 同时写入 completed RTT、logical message、transferred payload bytes 和 MAX RTT；smoke test 机器校验精确计数与 `P50 <= P95 <= P99 <= P99.9 <= MAX`。
 
 ## CPU、context switch、memory
 
@@ -88,7 +93,7 @@ CPU utilization = summed CPU time / parent wall time；两个 process 并行时�
 
 ## Environment record
 
-第一条 JSONL 记录 UTC、hostname、kernel、architecture、CPU model、online logical CPU count、page size、total memory、compiler、build type，以及 CMake configure 时嵌入的 source revision；之后每行是一条 result。
+JSONL schema 固定为 v1。第一条是 `environment`，记录唯一 `run_id`、UTC、hostname、kernel、architecture、CPU model、online logical CPU count、page size、total memory、compiler、build type，以及 CMake configure 时嵌入的 source revision。随后每个 required transport 恰好一条 `baseline_status`，再输出真实完成的 `result`；所有记录共享同一 `run_id`。不可用 baseline 不得出现 result。
 
 为了得到可比较证据：
 
@@ -109,7 +114,7 @@ cmake -S projects/fastipc -B projects/fastipc/build-release \
 cmake --build projects/fastipc/build-release --target fastipc_benchmark
 projects/fastipc/build-release/fastipc_benchmark
 projects/fastipc/build-release/fastipc_benchmark \
-  --transport=fastipc_zero_copy --access=touch_memory
+  --transport=fastipc_zero_copy --access=touch_memory --trials=5
 ```
 
-用 `--help` 查看 transport、access pattern、payload、iteration、warmup filter。stdout 为 JSONL；diagnostic 与 typed failure 输出到 stderr。
+用 `--help` 查看 transport、access pattern、payload、iteration、warmup 与 trial 选项。`--transport=all` 表示所有当前可用 baseline；`--strict-baselines` 会在完成可用 case 后，因任何 required baseline 缺失而返回 3。stdout 为 JSONL；diagnostic 与 typed failure 输出到 stderr。

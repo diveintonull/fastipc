@@ -12,11 +12,14 @@
 
 namespace fastipc::benchmark {
 
+inline constexpr std::uint32_t kBenchmarkSchemaVersion = 1U;
+
 enum class TransportKind : std::uint8_t {
   FastIpcCopy,
   FastIpcZeroCopy,
   UnixDomainSocket,
   Pipe,
+  Iceoryx,
 };
 
 enum class AccessPattern : std::uint8_t {
@@ -25,6 +28,7 @@ enum class AccessPattern : std::uint8_t {
 };
 
 struct CaseConfig {
+  std::string run_id;
   TransportKind transport{TransportKind::FastIpcCopy};
   AccessPattern access_pattern{AccessPattern::TransportOnly};
   std::size_t payload_bytes{64U};
@@ -32,15 +36,24 @@ struct CaseConfig {
   std::size_t warmup_iterations{10U};
   std::chrono::milliseconds operation_timeout{5000};
   std::uint64_t case_id{0U};
+  std::size_t trial{1U};
 };
 
 struct BenchmarkResult {
+  std::uint32_t schema_version{kBenchmarkSchemaVersion};
+  std::string run_id;
+  std::uint64_t case_id{0U};
+  std::size_t trial{0U};
+  std::string status{"ok"};
   std::string transport;
   std::string transport_mode;
   std::string access_pattern;
   std::size_t payload_bytes{0U};
   std::size_t iterations{0U};
   std::size_t warmup_iterations{0U};
+  std::uint64_t completed_round_trips{0U};
+  std::uint64_t logical_messages{0U};
+  std::uint64_t payload_bytes_transferred{0U};
   double wall_time_ms{0.0};
   double round_trips_per_second{0.0};
   double messages_per_second{0.0};
@@ -49,6 +62,7 @@ struct BenchmarkResult {
   double p95_us{0.0};
   double p99_us{0.0};
   double p99_9_us{0.0};
+  double max_us{0.0};
   double user_cpu_ms{0.0};
   double system_cpu_ms{0.0};
   double cpu_time_ms{0.0};
@@ -60,6 +74,8 @@ struct BenchmarkResult {
 };
 
 struct Environment {
+  std::uint32_t schema_version{kBenchmarkSchemaVersion};
+  std::string run_id;
   std::string timestamp_utc;
   std::string hostname;
   std::string kernel_release;
@@ -73,6 +89,14 @@ struct Environment {
   std::int64_t memory_total_kib{0};
 };
 
+struct BaselineStatus {
+  std::uint32_t schema_version{kBenchmarkSchemaVersion};
+  std::string run_id;
+  std::string transport;
+  bool available{false};
+  std::string detail;
+};
+
 [[nodiscard]] const char* TransportName(TransportKind transport) noexcept;
 [[nodiscard]] const char* AccessPatternName(
     AccessPattern access_pattern) noexcept;
@@ -80,6 +104,8 @@ struct Environment {
     std::string_view name) noexcept;
 [[nodiscard]] std::optional<AccessPattern> ParseAccessPattern(
     std::string_view name) noexcept;
+[[nodiscard]] std::vector<TransportKind> RequiredTransports();
+[[nodiscard]] std::vector<TransportKind> AvailableTransports();
 [[nodiscard]] std::vector<std::size_t> RequiredPayloadSizes();
 [[nodiscard]] std::size_t DefaultIterations(std::size_t payload_bytes);
 [[nodiscard]] std::size_t DefaultWarmupIterations(
@@ -87,7 +113,10 @@ struct Environment {
 
 [[nodiscard]] Result<BenchmarkResult> RunCase(const CaseConfig& config);
 [[nodiscard]] Environment CaptureEnvironment();
+[[nodiscard]] std::vector<BaselineStatus> CaptureBaselineStatuses(
+    std::string_view run_id);
 [[nodiscard]] std::string ToJson(const Environment& environment);
+[[nodiscard]] std::string ToJson(const BaselineStatus& status);
 [[nodiscard]] std::string ToJson(const BenchmarkResult& result);
 
 }  // namespace fastipc::benchmark

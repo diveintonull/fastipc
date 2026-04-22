@@ -18,7 +18,8 @@ FastIPC 是 Linux C++20 IPC library，基于 `kyr0/libsharedmemory` 深度派生
 - `Transport` API，包含 `SharedMemoryTransport`、`UnixDomainSocketTransport`；
 - UDS `SOCK_SEQPACKET`：64 KiB 内 inline frame；更大 payload 使用 sealed-memfd descriptor transfer；
 - 64 B 至 1 MiB 的 cross-process benchmark matrix，区分 copy/zero-copy 与 transport-only/touch-memory；
-- P50/P95/P99/P99.9、CPU、context switch、RSS 原始 JSONL；
+- Pipe、UDS、FastIPC Copy、FastIPC Zero-copy 四种真实 baseline；iceoryx 缺失时输出机器可读 unavailable，不伪造结果；
+- schema v1 JSONL，包含 run/case/trial identity、精确消息/字节计数、P50/P95/P99/P99.9/MAX、CPU、context switch、RSS；
 - 自动 Debug、Release、ASan、UBSan、TSan 覆盖。
 
 ## 架构
@@ -148,6 +149,7 @@ producer 与 consumer 通常位于不同 process；这里放在一起仅为展�
 - [零拷贝设计](docs/zero-copy-design.md)
 - [chunk 生命周期与恢复矩阵](docs/chunk-lifecycle.md)
 - [Copy 与 Zero-copy 实测结果](ZERO_COPY_BENCHMARK_RESULTS.md)
+- [统一 Benchmark 设计与 JSONL 合同](docs/benchmark.md)
 - [Benchmark 方法](docs/benchmark-methodology.md)
 - [原始 benchmark 与完整结果](BENCHMARK_RESULTS.md)
 - [两轮 perf 实验与原始 stat/record/report](benchmarks/profiling/README.md)
@@ -201,4 +203,5 @@ compiled FastIPC core 没有 vendor 两者的源码。
 - layout major 已升级到 2；旧 shared-memory object 会以 LayoutMismatch 拒绝。
 - 没有 authentication、encryption、namespace broker、SELinux policy integration、NUMA placement 或 real-time scheduling guarantee。
 - UDS sealed-memfd 是 descriptor-assisted shared memory，不是 pure socket-copy throughput。
+- iceoryx baseline 当前为 INCOMPLETE；依赖和专用 adapter 都可复核前不得产生数值结果。
 - 部署决策前必须在 native Linux 与 target hardware 重测 WSL2 数据。
