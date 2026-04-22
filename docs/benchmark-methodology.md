@@ -47,7 +47,7 @@ FastIPC 使用分离的 request/reply channel，因为每条 ring 都是 SPSC + 
 ```text
 iterations = clamp(
     64 MiB / (2 * payload_bytes),
-    100,
+    1,000,
     20,000)
 ```
 
@@ -70,7 +70,7 @@ payload_mib_per_second = 2 * iterations * payload_bytes
                          / (MiB * wall_seconds)
 ```
 
-每条 result 同时写入 completed RTT、logical message、transferred payload bytes 和 MAX RTT；smoke test 机器校验精确计数与 `P50 <= P95 <= P99 <= P99.9 <= MAX`。
+每条 result 同时写入 completed RTT、logical message、transferred payload bytes 和 MAX RTT；默认至少 1,000 个 measured sample，使 P99.9 不会因样本不足直接退化成 MAX。smoke test 机器校验精确计数与 `P50 <= P95 <= P99 <= P99.9 <= MAX`。1,000 个样本仍不足以给尾延迟建立窄置信区间，因此报告保留 raw trial，不把 P99.9 当作稳定 SLA。
 
 ## CPU、context switch、memory
 

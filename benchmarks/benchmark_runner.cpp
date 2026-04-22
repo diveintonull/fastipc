@@ -61,7 +61,7 @@ using namespace std::chrono_literals;
 
 constexpr std::size_t kMebibyte = 1024U * 1024U;
 constexpr std::uint64_t kTargetTransferredBytes = 64U * kMebibyte;
-constexpr std::size_t kMinimumIterations = 100U;
+constexpr std::size_t kMinimumIterations = 1000U;
 constexpr std::size_t kMaximumIterations = 20'000U;
 constexpr std::size_t kMaximumConfiguredIterations = 10'000'000U;
 
