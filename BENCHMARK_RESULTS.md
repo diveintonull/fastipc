@@ -1,68 +1,104 @@
-# FastIPC benchmark 结果
+# FastIPC 统一 benchmark 结果
 
-本报告来自一次真实 Release run。未经改动的证据是 [2026-08-20-wsl2-gcc13-c5cb58a.jsonl](benchmarks/results/2026-08-20-wsl2-gcc13-c5cb58a.jsonl)；测量定义与限制见 [benchmark-methodology.md](docs/benchmark-methodology.md)。
-
-本页保留升级前 copy/UDS/pipe 的历史基线；新增 FastIPC copy 与 zero-copy 的双访问模式对照、P99.9 和原始 JSONL 见 [ZERO_COPY_BENCHMARK_RESULTS.md](ZERO_COPY_BENCHMARK_RESULTS.md)。
-提交身份改写导致当前提交 ID 与原始证据文件名中的旧 ID 不同；对照见 [提交身份改写映射](../../COMMIT_IDENTITY_MAP.md)。原始 JSONL 未改写。
+本报告对应统一 benchmark schema v1 的一次真实 Release run。未经改写的原始证据是 [2026-08-21-unified-wsl2-gcc13-91fdeb0.jsonl](benchmarks/results/2026-08-21-unified-wsl2-gcc13-91fdeb0.jsonl)，测量定义见 [benchmark-methodology.md](docs/benchmark-methodology.md)，解释与边界见 [performance-analysis.md](docs/performance-analysis.md)。
 
 ## 证据身份
 
 | 字段 | 值 |
 | --- | --- |
-| UTC timestamp | 2026-08-20T06:14:40Z |
-| Source revision | `2539fb1efd56` |
+| UTC | 2026-08-20T23:29:37Z |
+| Source revision | `91fdeb0a8fe7b0df4806f5093ec3530c8da54dd6` |
+| Raw SHA-256 | `c4ae0630a398384b2ac19bc131d7bb574a244704624ca125cf51efea1deabb90` |
+| Run ID | `2026-08-20T23:29:37Z-492832-78476428807561-91fdeb0a8fe7` |
 | Build | Release，GNU 13.3.0 |
-| Host | `LAPTOP-NUKUM2JI`，WSL2 |
-| Kernel | `6.6.87.2-microsoft-standard-WSL2` |
+| Host / kernel | `LAPTOP-NUKUM2JI`，WSL2，`6.6.87.2-microsoft-standard-WSL2` |
 | CPU | Intel Core Ultra 9 275HX，24 个 online logical CPU |
-| Architecture | x86_64 |
-| Memory | `/proc/meminfo` 报告 15.33 GiB |
+| Architecture / memory | x86_64，15.33 GiB |
+| Protocol | 两个进程、single-outstanding ping-pong；latency 为 RTT |
 | Clock / quantile | `steady_clock`；nearest-rank |
-| Protocol | cross-process、single-outstanding ping-pong；latency 为 RTT |
+| Trial | 每个逻辑 case 3 轮；表格取三轮中位数，raw trial 全部保留 |
 
-数据包含 1 条 environment record 与 18 条 result record：三种 transport × 六种 payload。
+原始文件共 150 行：1 条 `environment`、5 条 `baseline_status`、144 条 `result`。144 条结果来自 4 种真实 transport × 2 种访问模式 × 6 种 payload × 3 trial，共 48 个逻辑 case。独立 jq 校验确认：
 
-## Shared memory：`spsc_ring_futex`
+- 所有记录共享同一 `run_id`，embedded revision 精确匹配；
+- 每个 case 恰好 trial 1/2/3；
+- `completed_round_trips == iterations`；
+- `logical_messages == 2 * iterations`；
+- `payload_bytes_transferred == logical_messages * payload_bytes`；
+- `P50 <= P95 <= P99 <= P99.9 <= MAX`；
+- 每个 result 至少 1,000 个 measured sample；
+- iceoryx 没有任何数值 result。
 
-| Payload | Iterations | Msg/s | MiB/s | P50 us | P95 us | P99 us | CPU % | Ctx V/I | RSS KiB P/C |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 B | 20,000 | 136,340.327 | 8.322 | 20.278 | 32.844 | 49.784 | 100.062 | 20,679 / 13 | 3,840 / 2,880 |
-| 256 B | 20,000 | 134,551.909 | 32.850 | 21.339 | 28.519 | 43.531 | 99.714 | 21,591 / 1 | 3,840 / 2,304 |
-| 1 KiB | 20,000 | 141,888.891 | 138.563 | 13.976 | 27.801 | 42.341 | 103.242 | 19,897 / 0 | 3,840 / 2,504 |
-| 4 KiB | 8,192 | 134,734.303 | 526.306 | 6.684 | 33.092 | 40.673 | 109.519 | 7,371 / 0 | 3,840 / 2,496 |
-| 64 KiB | 512 | 54,554.168 | 3,409.635 | 35.805 | 47.037 | 59.913 | 98.927 | 1,007 / 0 | 4,032 / 2,688 |
-| 1 MiB | 100 | 11,790.426 | 11,790.426 | 166.157 | 189.523 | 222.607 | 106.863 | 199 / 0 | 9,784 / 7,296 |
+默认 iteration 为 64 B/256 B/1 KiB 各 20,000，4 KiB 为 8,192，64 KiB/1 MiB 各 1,000。warmup 不计入指标。
 
-## Unix Domain Socket
+## Transport-only 中位数
 
-64 B–64 KiB 使用 `seqpacket_inline`；1 MiB 使用 `seqpacket_sealed_memfd`，因此是 descriptor-assisted shared memory，不是 pure socket-copy throughput。
+`transport_only` 只写/读前 8 B sequence；表中 MiB/s 是按逻辑 payload 大小换算的 transport capacity，不表示应用真的读写了整块 payload。
 
-| Payload | Iterations | Msg/s | MiB/s | P50 us | P95 us | P99 us | CPU % | Ctx V/I | RSS KiB P/C |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 B | 20,000 | 71,405.894 | 4.358 | 24.111 | 39.023 | 56.032 | 52.735 | 39,982 / 0 | 9,784 / 1,344 |
-| 256 B | 20,000 | 70,167.908 | 17.131 | 23.597 | 49.915 | 74.412 | 51.391 | 39,985 / 0 | 9,784 / 1,344 |
-| 1 KiB | 20,000 | 72,891.012 | 71.183 | 24.001 | 39.910 | 56.880 | 53.435 | 39,986 / 0 | 9,784 / 1,344 |
-| 4 KiB | 8,192 | 69,903.345 | 273.060 | 25.292 | 40.379 | 53.898 | 54.557 | 16,384 / 0 | 9,784 / 1,344 |
-| 64 KiB | 512 | 52,200.913 | 3,262.557 | 36.363 | 45.711 | 77.293 | 68.718 | 1,024 / 0 | 9,784 / 1,344 |
-| 1 MiB | 100 | 3,359.819 | 3,359.819 | 551.098 | 798.621 | 900.933 | 94.663 | 200 / 0 | 9,784 / 2,112 |
+| Payload | Copy MiB/s | Copy P99 �s | Zero-copy MiB/s | Zero P99 �s | UDS MiB/s | UDS P99 �s | Pipe MiB/s | Pipe P99 �s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 B | 7.781 | 54.258 | 6.007 | 63.114 | 3.415 | 90.064 | 3.855 | 79.054 |
+| 256 B | 31.878 | 53.059 | 24.055 | 77.689 | 14.974 | 86.489 | 17.109 | 70.494 |
+| 1 KiB | 103.790 | 54.308 | 78.517 | 77.898 | 57.837 | 83.041 | 61.153 | 83.584 |
+| 4 KiB | 361.631 | 60.107 | 350.211 | 65.918 | 226.026 | 87.838 | 274.615 | 75.182 |
+| 64 KiB | 3,432.533 | 98.770 | 5,834.547 | 64.405 | 2,482.768 | 114.746 | 2,133.572 | 150.691 |
+| 1 MiB | 10,490.071 | 428.291 | 92,353.521 | 58.327 | 2,548.875 | 1,256.767 | 1,371.465 | 2,578.064 |
 
-## Pipe：`dual_nonblocking_pipe`
+1 MiB zero-copy 的 92,353.521 MiB/s 是逻辑速率：slot payload 没有被 producer/consumer 全量触碰。三轮分别为 56,641.306、92,353.521、269,373.439 MiB/s，说明 active-spin、futex 与 WSL2 调度形成明显双峰；不能把最高轮当作稳定内存带宽。
 
-| Payload | Iterations | Msg/s | MiB/s | P50 us | P95 us | P99 us | CPU % | Ctx V/I | RSS KiB P/C |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 B | 20,000 | 78,471.689 | 4.790 | 21.261 | 39.609 | 56.080 | 44.184 | 39,987 / 0 | 9,784 / 968 |
-| 256 B | 20,000 | 79,296.616 | 19.360 | 21.042 | 37.109 | 57.260 | 44.814 | 39,974 / 1 | 9,784 / 1,152 |
-| 1 KiB | 20,000 | 89,900.934 | 87.794 | 19.230 | 32.971 | 46.555 | 49.132 | 39,978 / 0 | 9,784 / 1,152 |
-| 4 KiB | 8,192 | 95,579.600 | 373.358 | 19.111 | 30.535 | 49.164 | 50.668 | 16,380 / 0 | 9,784 / 1,152 |
-| 64 KiB | 512 | 49,511.514 | 3,094.470 | 37.028 | 53.365 | 98.073 | 77.753 | 1,024 / 0 | 9,784 / 1,152 |
-| 1 MiB | 100 | 2,047.105 | 2,047.105 | 962.418 | 1,163.845 | 1,216.347 | 70.736 | 6,138 / 0 | 9,784 / 1,920 |
+## Touch-memory 中位数
 
-## 本次 run 说明什么
+`touch_memory` 要求 producer 写完整 payload、consumer 逐字节读并验证完整 payload，更接近“应用实际使用消息内容”的成本边界。
 
-- 64 B–4 KiB：shared memory 约 134k–142k logical msg/s，socket 约 70k–73k，pipe 约 78k–96k。
-- 64 KiB：同步协议下三条路径约 3.09–3.41 GiB/s。
-- 1 MiB：shared memory 为 11,790 MiB/s、P50 RTT 166 us；sealed memfd socket 为 3,360 MiB/s、551 us；pipe 为 2,047 MiB/s、962 us。
-- small-message socket/pipe 每 RTT 接近两次 voluntary context switch；shared memory 多数 row 接近一次。
-- summed CPU 可超过 100%，因为包含两个 process。
+| Payload | Copy MiB/s | Copy P99 �s | Zero-copy MiB/s | Zero P99 �s | UDS MiB/s | UDS P99 �s | Pipe MiB/s | Pipe P99 �s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 B | 5.998 | 67.669 | 5.548 | 68.972 | 4.040 | 70.524 | 3.630 | 89.011 |
+| 256 B | 16.798 | 85.446 | 17.784 | 75.180 | 14.092 | 83.939 | 14.677 | 85.927 |
+| 1 KiB | 58.141 | 80.160 | 58.120 | 77.471 | 55.095 | 93.718 | 58.091 | 85.091 |
+| 4 KiB | 184.123 | 90.875 | 171.901 | 92.560 | 152.317 | 126.455 | 189.369 | 94.756 |
+| 64 KiB | 599.063 | 323.747 | 645.660 | 301.708 | 638.981 | 332.048 | 610.322 | 349.501 |
+| 1 MiB | 754.574 | 3,403.197 | 832.204 | 2,840.458 | 646.257 | 3,812.628 | 502.663 | 5,131.284 |
 
-这些只是一次 WSL2 run 的 observation，不是 production claim 或 universal ranking。scheduler placement、CPU frequency、native Linux、NUMA topology、contention、multi-outstanding workload 需要独立实验。
+在本次 WSL2 run 中：
+
+- 64 B zero-copy 比 copy 低 7.5%，说明小消息的 loan/take ownership 状态机成本高于避免的小复制；
+- 1 KiB 两者几乎相同；
+- 64 KiB zero-copy 吞吐比 copy 高 7.8%，P99 低 6.8%；
+- 1 MiB zero-copy 吞吐比 copy 高 10.3%，P99 低 16.5%；
+- 4 KiB pipe 的中位吞吐略高于两种 FastIPC，说明不存在“共享内存对所有 payload 都必胜”的结论；
+- 64 KiB 的 UDS 与 zero-copy 很接近，但 UDS 1 MiB 使用 sealed memfd + descriptor transfer，不能称为 pure socket-copy。
+
+## CPU、context switch 与 RSS
+
+1 MiB `touch_memory` 的中位数：
+
+| Transport | CPU % | Context switch | Parent/child peak RSS KiB |
+| --- | ---: | ---: | ---: |
+| FastIPC copy | 98.590 | 2,045 | 10,360 / 8,260 |
+| FastIPC zero-copy | 98.637 | 2,041 | 10,360 / 6,532 |
+| UDS sealed memfd | 98.721 | 2,002 | 10,360 / 3,076 |
+| Pipe | 85.742 | 61,057 | 10,360 / 2,884 |
+
+pipe 处理 1 MiB 时产生大量 partial-I/O wakeup；其 context switch 明显高于 shared-memory 与 descriptor-assisted UDS。RSS 是进程生命周期峰值，parent 按固定 case 顺序运行后峰值只增不减，所以不能把表中 RSS 当作每条消息的增量内存，也不能跨 row 做精细排名。
+
+## iceoryx 状态
+
+本机 CMake preflight 没有找到 `iceoryx_posh`，当前 revision 也没有实现专用 benchmark adapter。因此 iceoryx 为 **INCOMPLETE / unavailable**，原始文件只有一条带 reason 的 `baseline_status`，没有 throughput、latency 或假的零值。
+
+rigtorp SPSC 不包含跨进程 transport、映射、内核 IPC 或 peer failure，不进入这张公平比较表。
+
+## 验证矩阵
+
+同一最终源码在全新 build directory 中通过：
+
+| 配置 | 结果 | 日志 |
+| --- | ---: | --- |
+| Debug | 22/22 | [日志](tests/results/2026-08-21-debug-91fdeb0.log) |
+| Release | 22/22 | [日志](tests/results/2026-08-21-release-91fdeb0.log) |
+| ASan | 22/22 | [日志](tests/results/2026-08-21-asan-91fdeb0.log) |
+| UBSan | 22/22 | [日志](tests/results/2026-08-21-ubsan-91fdeb0.log) |
+| TSan | 22/22 | [日志](tests/results/2026-08-21-tsan-91fdeb0.log) |
+
+TSan 在该 WSL2 kernel 下使用仓库已记录的 `setarch x86_64 -R` wrapper；不使用它时 runtime 会在测试逻辑前因 shadow-memory mapping 冲突退出。
+
+这些结果只描述所记录主机、固定顺序、未固定 CPU affinity、single-outstanding RTT workload。它们不是 native Linux、目标机器人硬件、NUMA、多 producer 或 saturated streaming 的性能承诺。

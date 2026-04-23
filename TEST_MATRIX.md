@@ -120,3 +120,28 @@ ctest --test-dir BUILD --output-on-failure
 ASan、UBSan、TSan 分别在 `CMAKE_CXX_FLAGS` 中加入对应 `-fsanitize=...` 与 `-fno-omit-frame-pointer`。本机 TSan 继续使用上文记录的 `setarch x86_64 -R` 包装；不使用该包装时 WSL2 会在测试代码运行前报告 shadow-memory mapping 冲突。
 
 该矩阵证明已自动化路径在本环境中通过，不宣称穷举所有跨进程交错，也不代替 native Linux、ARM 或真实机器人硬件验证。
+
+
+## 2026-08-21 统一 benchmark 增量验证
+
+本节记录 schema v1、baseline availability、trial identity、精确计数与尾延迟样本下限进入最终源码后的全新构建结果。
+
+| 字段 | 值 |
+| --- | --- |
+| Revision | `91fdeb0a8fe7b0df4806f5093ec3530c8da54dd6` |
+| 主机 / 内核 | WSL2 / `6.6.87.2-microsoft-standard-WSL2` |
+| 编译器 | GNU 13.3.0 |
+| CTest | 每种配置 22 项 |
+| 合计 | 110/110 |
+
+| 配置 | Sanitizer 参数 | 通过 | 失败 | 原始日志 |
+| --- | --- | ---: | ---: | --- |
+| Debug | 无 | 22 | 0 | [日志](tests/results/2026-08-21-debug-91fdeb0.log) |
+| Release | 无 | 22 | 0 | [日志](tests/results/2026-08-21-release-91fdeb0.log) |
+| ASan | `detect_leaks=1:halt_on_error=1` | 22 | 0 | [日志](tests/results/2026-08-21-asan-91fdeb0.log) |
+| UBSan | `halt_on_error=1:print_stacktrace=1` | 22 | 0 | [日志](tests/results/2026-08-21-ubsan-91fdeb0.log) |
+| TSan | `halt_on_error=1:second_deadlock_stack=1` | 22 | 0 | [日志](tests/results/2026-08-21-tsan-91fdeb0.log) |
+
+benchmark smoke 机器校验 environment/baseline/result record 数、统一 run ID、schema、case/trial/status、精确 RTT/消息/字节公式、quantile 顺序、iceoryx unavailable 无假 result、显式 unavailable exit 3、strict-mode exit 3，以及两轮 trial identity。
+
+该 WSL2 的 GCC TSan 仍使用 `setarch x86_64 -R`；直接运行会在测试代码开始前因 shadow-memory mapping conflict 退出。最终 TSan 日志来自 wrapper 下的真实 22/22，不包含 suppression。

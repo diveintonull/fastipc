@@ -123,3 +123,18 @@ benchmark smoke 必须机器校验：
 - MPMC contention；
 - target-hardware hard real-time 结论；
 - 自动把单次 WSL2 数字写成产品性能承诺。
+
+
+## 8. 最终证据
+
+最终 Release raw matrix：
+
+- revision：`91fdeb0a8fe7b0df4806f5093ec3530c8da54dd6`；
+- 文件：[2026-08-21-unified-wsl2-gcc13-91fdeb0.jsonl](../benchmarks/results/2026-08-21-unified-wsl2-gcc13-91fdeb0.jsonl)；
+- SHA-256：`c4ae0630a398384b2ac19bc131d7bb574a244704624ca125cf51efea1deabb90`；
+- 记录：1 environment + 5 baseline status + 144 result；
+- 结构：48 个逻辑 case，每个 3 trial，所有 result 至少 1,000 measured sample；
+- 独立 jq invariant 校验：通过；
+- iceoryx：**INCOMPLETE / unavailable**，无数值 result。
+
+汇总见 [BENCHMARK_RESULTS.md](../BENCHMARK_RESULTS.md)，解释见 [performance-analysis.md](performance-analysis.md)。

@@ -152,6 +152,7 @@ producer 与 consumer 通常位于不同 process；这里放在一起仅为展�
 - [统一 Benchmark 设计与 JSONL 合同](docs/benchmark.md)
 - [Benchmark 方法](docs/benchmark-methodology.md)
 - [原始 benchmark 与完整结果](BENCHMARK_RESULTS.md)
+- [性能分析与统计边界](docs/performance-analysis.md)
 - [两轮 perf 实验与原始 stat/record/report](benchmarks/profiling/README.md)
 - [五种配置测试矩阵与原始 CTest 日志](TEST_MATRIX.md)
 - [故障矩阵](docs/fault-matrix.md)
