@@ -1,6 +1,6 @@
 # FastIPC
 
-FastIPC 是 Linux C++20 IPC library，基于 `kyr0/libsharedmemory` 深度派生并明确标注来源。当前 core 提供 versioned SPSC shared-memory channel、带 absolute deadline 的 futex blocking、peer liveness/restart fencing、显式 backpressure，以及由 shared memory 与 Unix Domain Socket 实现的统一 transport seam。
+FastIPC 是 Linux C++20 IPC library，基于 `kyr0/libsharedmemory` 深度派生并明确标注来源。当前 core 提供 versioned SPSC zero-copy channel、独立的 bounded MPMC copy channel、带 absolute deadline 的 futex blocking、peer liveness/restart fencing、显式 backpressure，以及 Unix Domain Socket transport。
 
 
 ## 能力
@@ -8,6 +8,8 @@ FastIPC 是 Linux C++20 IPC library，基于 `kyr0/libsharedmemory` 深度派生
 - Linux POSIX shared-memory mapping，带 creator/open validation，默认 mode 0600；
 - versioned、endian-marked layout，包含 total size、initialization state、generation 与 chunk lifecycle；
 - cache-line 隔离的 SPSC head/tail cursor 与 fixed-capacity slot；
+- 独立的 bounded MPMC：全局 enqueue/dequeue CAS reservation、per-slot sequence、跨线程/跨进程并发；
+- MPMC 正常执行时提供 FIFO reservation 与恰好一次竞争消费；abandoned reservation 恢复明确标为 `INCOMPLETE`；
 - `Loan/Publish/Take/Release` 零拷贝 ownership API，move-only RAII handle；
 - warmed 成功路径无逐消息普通堆分配，copy API 复用同一 lifecycle；
 - generation、owner token 与 slot state 的 acquire/release/CAS 审计；
@@ -37,17 +39,26 @@ Application
     |      +-- active spin -> futex epoch wait
     |      +-- generation / role / heartbeat control plane
     |
+    +-- MpmcSharedMemoryTransport
+    |      +-- Copy seam { Send, Receive }
+    |      +-- bounded power-of-two ring
+    |      +-- enqueue/dequeue position CAS
+    |      +-- per-slot sequence acquire/release
+    |      +-- active spin -> futex epoch wait
+    |
     +-- UnixDomainSocketTransport
            +-- AF_UNIX SOCK_SEQPACKET
            +-- inline frame or sealed memfd + SCM_RIGHTS
 ```
 
-shared memory 分为两条 ownership plane：
+SPSC shared memory 分为两条 ownership plane：
 
 - data plane：一个 producer 独占 `head` 与 slot write；一个 consumer 独占 `tail` 与 slot read；
 - control plane：role claim、generation、PID/start-ticks identity、heartbeat、cleanup。
 
 heartbeat `jthread` 是 lease timestamp 的唯一 writer；成功 message operation 只增加独立 progress sequence。
+
+MPMC 使用另一套 magic/layout，没有 endpoint role 与 Loan handle；任何成功 `Open` 的 participant 都可并发 Send/Receive。两套布局与算法刻意隔离，避免 MPMC CAS 进入已验证的 SPSC 热路径。
 
 ## 构建与测试
 
@@ -66,8 +77,10 @@ ctest --test-dir build --output-on-failure
 
 - `FastIPC::fastipc`：static library target；
 - `fastipc_tests`：shared-memory behavior/fault executable；
+- `fastipc_mpmc_tests`：MPMC 单元、线程、跨进程与 abandoned-reservation executable；
 - `fastipc_uds_tests`：Unix-socket behavior/hostile-input executable；
-- `fastipc_benchmark`：JSONL benchmark runner。
+- `fastipc_benchmark`：跨进程 transport JSONL benchmark runner；
+- `fastipc_mpmc_benchmark`：1P1C/2P2C/4P4C contention JSONL runner。
 
 ## Shared-memory 示例
 
@@ -132,6 +145,38 @@ if (sample) {
 
 producer 与 consumer 通常位于不同 process；这里放在一起仅为展示 public seam。
 
+## MPMC 示例
+
+```cpp
+#include <fastipc/mpmc_shared_memory_transport.hpp>
+
+fastipc::MpmcChannelConfig config;
+config.name = "worker_queue";
+config.capacity = 1024;  // 必须是至少 2 的 2 次幂。
+config.max_message_size = 4096;
+config.unlink_on_owner_close = true;
+
+auto owner_result =
+    fastipc::MpmcSharedMemoryTransport::Create(config);
+auto peer_result =
+    fastipc::MpmcSharedMemoryTransport::Open(config);
+if (!owner_result || !peer_result) {
+  return;
+}
+
+auto owner = std::move(owner_result).take_value();
+auto peer = std::move(peer_result).take_value();
+
+owner->Send(
+    payload,
+    {fastipc::BackpressurePolicy::Block,
+     fastipc::Deadline::After(100ms)});
+peer->Receive(
+    destination, fastipc::Deadline::After(100ms));
+```
+
+`Create` 只做独占初始化；creator 与 opener 都能并发生产或消费。MPMC 当前是 copy-in/copy-out，不提供 Loan API。destination 太小时，已经 reserve 的消息会被释放并计为 dropped，再返回 `BufferTooSmall`，以免全局 dequeue cursor 永久停住。
+
 ## Backpressure 与 failure surface
 
 `SendOptions` policy：
@@ -148,6 +193,7 @@ producer 与 consumer 通常位于不同 process；这里放在一起仅为展�
 
 - [零拷贝设计](docs/zero-copy-design.md)
 - [chunk 生命周期与恢复矩阵](docs/chunk-lifecycle.md)
+- [MPMC 算法、证明边界与故障模型](docs/mpmc-design.md)
 - [Copy 与 Zero-copy 实测结果](ZERO_COPY_BENCHMARK_RESULTS.md)
 - [统一 Benchmark 设计与 JSONL 合同](docs/benchmark.md)
 - [Benchmark 方法](docs/benchmark-methodology.md)
@@ -195,7 +241,16 @@ compiled FastIPC core 没有 vendor 两者的源码。
 
 ## 局限
 
-- 仅 SPSC；MPSC/MPMC 需要不同 reservation/recovery proof。
+- SPSC 零拷贝与 MPMC copy 是独立 layout；MPMC 不提供 Loan/Take，也不提供 fan-out。
+- MPMC 只承诺正常执行期间的并发正确性；producer 在 reserve 后、publish 前退出会留下 FIFO hole，恢复仍为 **INCOMPLETE**。
+
+```text
+Known limitation:
+MPMC guarantees concurrent correctness during normal execution,
+but producer termination after reservation and before publication
+does not yet provide full robust recovery.
+```
+
 - 每个 endpoint 同时最多一个未完成 loan/sample；slot 与最大 payload 在 setup 时固定。
 - shared-memory peer 必须使用相同 Linux ABI 与兼容 FastIPC layout。
 - heartbeat 只提供 bounded suspicion，不能证明 paused process 永久死亡。

@@ -2,7 +2,7 @@
 
 ## 范围
 
-本文审计 libsharedmemory baseline 之后引入的 Linux SPSC shared-memory channel。实现位于 `src/shared_memory_transport.cpp`，byte layout 位于 `src/shared_memory_layout.hpp`，public seam 为 `Transport`。
+本文分别审计 libsharedmemory baseline 之后引入的 Linux SPSC zero-copy channel，以及本轮新增的独立 bounded MPMC copy channel。SPSC 实现/布局位于 `src/shared_memory_transport.cpp` 与 `src/shared_memory_layout.hpp`；MPMC 实现/布局位于 `src/mpmc_shared_memory_transport.cpp` 与 `src/mpmc_shared_memory_layout.hpp`；两者都实现 `Transport` seam。
 
 contract 面向相同 ABI 构建的 Linux process。实现对 `MAP_SHARED` memory 内自然对齐的 32/64-bit integer 使用 GCC/Clang atomic builtin；compile-time check 要求两种宽度始终 lock-free。FastIPC 不声称 ISO C++ abstract machine 单独保证 process-shared atomic 在所有平台可移植。
 
@@ -46,7 +46,7 @@ head/tail 位于不同 cache line。endpoint metadata、queue geometry、epoch�
 
 稳定会话内的队列仍是 SPSC；但崩溃接管会让旧端点与替代端点在极窄窗口共同尝试发布同一游标。普通存储可能让暂停后恢复的旧执行流把已经前进的 head/tail 写回旧值，因此游标发布使用 `expected == handle.cursor` 的 compare-exchange。只有胜者计数和唤醒；失败方返回或收敛到新游标。
 
-槽位 CAS 负责借用生命周期与可复用/重投递稳定态；游标 CAS 只负责同一 SPSC 逻辑位置的幂等发布。两者都不是多生产者预留机制。若加入 MPMC，仍需全新的预留/游标协议与证明，不能把这些 CAS 直接宣称为 MPMC-safe。
+槽位 CAS 负责借用生命周期与可复用/重投递稳定态；游标 CAS 只负责同一 SPSC 逻辑位置的幂等发布。两者都不是多生产者预留机制。新增 MPMC 使用独立共享布局、全局 reservation cursor 与 per-slot sequence；没有复用或修改这套 SPSC hot path。
 
 ## Futex 纪元协议
 
@@ -83,8 +83,89 @@ producer loan 暴露可写 span，存活 process 中的旧写者无法被撤销�
 
 consumer sample 只读，因此稳定的 `LoanedToConsumer` 在 consumer role token 被替换或 owner 死亡后可恢复为 `Published` 并至少一次重投递；旧 sample 的 `Release` 因 tag 不匹配返回 `StaleGeneration`。`ConsumerTaking` 是 owner tag 尚可能写到一半的 transient state，原 process 仍存活时 replacement 返回 `WouldBlock`，只有确认死亡后才重投递。
 
-## Buffer 与 corruption semantics
+## SPSC Buffer 与 corruption semantics
 
 copy `Receive` 先 `Take`。若 destination 太小，它把 `LoanedToConsumer` 直接 CAS 回 `Published`，不推进 tail，再返回 `BufferTooSmall`；后续更大 buffer 或 zero-copy `Take` 仍能取得同一消息。
 
 slot length 超 configured max 或 sequence 不匹配时返回 `CorruptData`，不推进 tail，保留故障 evidence，避免 silent loss。普通 `Receive` 不猜测如何丢弃 corrupt generation。
+
+## MPMC 独立内存模型
+
+### 布局与 false sharing 边界
+
+MPMC header、queue geometry、enqueue cursor、dequeue cursor 各占一个 64 B cache line。每个 slot 也以 cache line 开始：
+
+```text
+enqueue.position | data_epoch | enqueue counters
+dequeue.position | space_epoch | dequeue counters
+
+Slot[position & (capacity - 1)]
+  sequence
+  length
+  payload
+```
+
+capacity 必须是至少 2 的 2 次幂，因此索引用 mask 计算。slot `i` 初始化为 `sequence=i`。SPSC 与 MPMC 使用不同 magic/version；错误地用另一种 config 打开时返回 `LayoutMismatch`，不能把一种算法的 cursor 解释成另一种。
+
+### Reservation 与 publication
+
+Producer 针对 position `p`：
+
+1. relaxed 读取 `enqueue.position`；
+2. acquire 读取 slot sequence；
+3. `sequence == p` 时以 relaxed CAS 把 enqueue position 从 `p` 推到 `p+1`，获得独占 reservation；
+4. 普通写 length/payload；
+5. release 写 `sequence=p+1`，发布消息。
+
+Consumer 针对 position `p`：
+
+1. relaxed 读取 `dequeue.position`；
+2. acquire 读取 slot sequence，期望 `p+1`；
+3. relaxed CAS 把 dequeue position 从 `p` 推到 `p+1`，独占该消息；
+4. 普通读/copy/校验 length 与 payload；
+5. release 写 `sequence=p+capacity`，允许下一轮 producer 复用。
+
+| MPMC 字段 / 操作 | Writer order | Reader order | 证明作用 |
+| --- | --- | --- | --- |
+| `header.init_state` | release | acquire | Open 校验前看见完整静态布局与初始 sequence |
+| `enqueue.position` | relaxed CAS | relaxed load/CAS | 只分配唯一 producer position；payload 可见性不依赖 cursor |
+| slot `sequence=p+1` | producer release store | consumer acquire load | publication 之前的 length/payload 写 happens-before consumer 读取 |
+| `dequeue.position` | relaxed CAS | relaxed load/CAS | 只分配唯一 consumer position |
+| slot `sequence=p+capacity` | consumer release store | producer acquire load | consumer 完成 payload 读取后，producer 才能复用该槽 |
+| data/space epoch | release fetch-add | acquire load | 在 futex wake 前排序 sequence publication，并提供防丢唤醒快照 |
+| counter | relaxed fetch-add | relaxed load | 仅诊断，不承担 ownership publication |
+
+cursor CAS 可以 relaxed，是因为它只决定“谁拥有 position”；同一 slot 的 producer→consumer 与 consumer→下一轮 producer 可见性完全由 sequence release/acquire 链承担。增加 seq_cst 不会修复 abandoned reservation。
+
+### FIFO 与线性化边界
+
+成功 enqueue CAS 决定 producer reservation 顺序。position 101 可以早于 position 100 完成 payload，但 consumer 的 dequeue position 仍停在 100，不会跳过未发布 slot，因此保留 FIFO reservation order。代价是较早 producer 被暂停时产生 head-of-line blocking。
+
+成功 dequeue CAS 保证每个逻辑 position 只交给一个 consumer；callback/业务处理完成顺序仍可能不同，不能把它解释为“多个 consumer 按完成时间全局有序”。
+
+sequence difference 使用 64-bit 模数算术，并假设活动 cursor 距离小于 `2^63`。超过该生命周期的连续运行尚未验证，文档不声称无限次 wrap proof。
+
+### MPMC futex 纪元
+
+full/empty 快照不是最终条件。waiter 执行：
+
+```text
+尝试 reserve
+读取对端 epoch
+再次尝试 reserve
+futex WAIT_BITSET(epoch, saved_epoch, monotonic absolute deadline)
+```
+
+对端若在 epoch 读取后 publish/release，会先 release increment epoch 再 wake；waiter 进入内核较晚时看到值不等而得到 `EAGAIN`。active spin、`EINTR`、伪唤醒都回到 sequence predicate，且不重置原 caller deadline。
+
+### Abandoned reservation：明确未完成
+
+Producer 在 enqueue CAS 后、release sequence 前退出时，该 slot 仍保持旧 sequence。后续 producer 可以发布更大 position，但 consumer 为保留 FIFO 不能越过 hole。仅凭 wall time 或 heartbeat reclaim 不正确：原 producer 可能只是暂停，迟到写入会与复用后的 slot 竞争。
+
+Consumer 在 dequeue CAS 后退出也不会 release sequence；队列绕回后 producer 最终会被该槽阻塞。本阶段没有在 slot 中加入 owner PID/generation/fencing，也没有宣称恢复。
+
+`tests/mpmc_test.cpp` 的 `abandoned_reservation` case 让子进程只完成 enqueue CAS 就退出，再验证后续消息已发布但 dequeue 超时。这个测试证明限制真实存在，而不是证明 crash recovery。
+
+### MPMC BufferTooSmall 语义
+
+MPMC consumer 只有成功 CAS reservation 后才能无数据竞争地读取 length；此时全局 dequeue cursor 已经推进，不能像 SPSC 单 consumer 那样安全 requeue。若 destination 太小，实现 release slot、把消息计为 dropped 并返回 `BufferTooSmall`，从而保证队列继续前进。需要无损可变长接收的调用方应使用固定最大 buffer 或在应用 envelope 中固定大小；当前 MPMC 不提供无损 Peek/Take API。

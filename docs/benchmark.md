@@ -120,7 +120,7 @@ benchmark smoke 必须机器校验：
 - iceoryx 的下载、vendor 或未验证适配；
 - saturated streaming/多 outstanding；
 - one-way clock synchronization；
-- MPMC contention；
+- 把 MPMC contention 与跨进程 ping-pong transport 混成同一性能排名；MPMC 使用下文独立矩阵；
 - target-hardware hard real-time 结论；
 - 自动把单次 WSL2 数字写成产品性能承诺。
 
@@ -138,3 +138,62 @@ benchmark smoke 必须机器校验：
 - iceoryx：**INCOMPLETE / unavailable**，无数值 result。
 
 汇总见 [BENCHMARK_RESULTS.md](../BENCHMARK_RESULTS.md)，解释见 [performance-analysis.md](performance-analysis.md)。
+
+## 9. MPMC Contention 独立基准
+
+`fastipc_mpmc_benchmark` 不进入 Pipe/UDS/SPSC transport 排名。它回答的是 bounded MPMC 在 producer/consumer 线程竞争下的 reservation、cache coherence、copy 与 futex 代价；跨进程正确性另由 `fastipc.mpmc.process_exactly_once` 验证。把两类数字放进同一表会改变问题定义。
+
+默认矩阵：
+
+```text
+Topology: 1P1C, 2P2C, 4P4C
+Payload:  64 B, 1 KiB, 64 KiB
+Mode:     touch_memory
+Trial:    raw independent trial
+```
+
+每个 producer 拥有独立 payload buffer，在 barrier 前完成 allocation。测量窗口内，producer 写满 payload、写入 ID/monotonic send timestamp/checksum，再调用 MPMC `Send`；consumer `Receive` 后校验完整 payload、ID 与 checksum，并把每个唯一 ID 的 E2E latency 写到预分配 atomic array。E2E latency 从 producer 尝试发送前到 consumer 完成接收后，包含 queue wait/copy，不是纯 CAS latency。
+
+每个 trial 先在独立 queue 上跑 warmup，再新建 queue 执行测量。默认 measured message 数按 payload 调整，在每 producer 1,000–100,000 条之间；`--messages` 可以固定。runner 支持：
+
+```bash
+./fastipc_mpmc_benchmark --trials=3
+./fastipc_mpmc_benchmark \
+  --topology=4x4 \
+  --payload=64K \
+  --messages=2000 \
+  --warmup=200 \
+  --trials=3
+```
+
+JSONL schema v1 包含一条 `environment` 与每 trial 一条 `result`。result 至少记录：
+
+- run/case/trial/source revision；
+- producers、consumers、payload、warmup 与 measured messages；
+- expected/sent/received、missing、duplicate、checksum error；
+- queue send/receive timeout；
+- wall time、message/s、payload MiB/s；
+- P50/P95/P99/P99.9/MAX E2E latency；
+- CPU time/utilization、voluntary/involuntary context switch、peak RSS。
+
+成功 result 必须满足：
+
+```text
+expected_messages == producers * messages_per_producer
+sent_messages == expected_messages
+received_messages == expected_messages
+missing_messages == 0
+duplicate_messages == 0
+checksum_errors == 0
+P50 <= P95 <= P99 <= P99.9 <= MAX
+```
+
+smoke test 会解析每一行 JSON、检查统一 run ID、1P1C/2P2C coverage、exact-count、quantile order 与两个独立 trial。worker 出现 timeout、corruption 或计数不一致时进程非零退出，不生成 `status=ok`。
+
+限制：
+
+- 当前 contention runner 使用同一进程中的多个线程和同一个 mapping；它测算法竞争，不含多进程调度成本；
+- 没有固定 affinity、NUMA placement、CPU governor 或 case randomization；
+- producer payload fill 与 consumer full validation 都在测量窗口内，因此是 touch-memory workload；
+- CPU utilization 汇总整个进程所有线程，可以超过 100%；
+- 该 benchmark 不证明 crash recovery；abandoned reservation 仍为 `INCOMPLETE`。
