@@ -1,0 +1,64 @@
+Internal ctest changing into directory: /home/phil/job/new/projects/fastipc/build-verify-asan
+Test project /home/phil/job/new/projects/fastipc/build-verify-asan
+      Start  1: fastipc.transport
+ 1/27 Test  #1: fastipc.transport ........................   Passed    1.39 sec
+      Start  2: fastipc.zero_copy
+ 2/27 Test  #2: fastipc.zero_copy ........................   Passed    0.23 sec
+      Start  3: fastipc.zero_copy.no_allocation
+ 3/27 Test  #3: fastipc.zero_copy.no_allocation ..........   Passed    0.01 sec
+      Start  4: fastipc.fault.producer_loan_crash
+ 4/27 Test  #4: fastipc.fault.producer_loan_crash ........   Passed    0.01 sec
+      Start  5: fastipc.fault.consumer_sample_crash
+ 5/27 Test  #5: fastipc.fault.consumer_sample_crash ......   Passed    0.01 sec
+      Start  6: fastipc.fault.outstanding_handle_close
+ 6/27 Test  #6: fastipc.fault.outstanding_handle_close ...   Passed    0.01 sec
+      Start  7: fastipc.fault.producer_paused_takeover
+ 7/27 Test  #7: fastipc.fault.producer_paused_takeover ...   Passed    0.10 sec
+      Start  8: fastipc.fault.consumer_paused_takeover
+ 8/27 Test  #8: fastipc.fault.consumer_paused_takeover ...   Passed    0.10 sec
+      Start  9: fastipc.mpmc
+ 9/27 Test  #9: fastipc.mpmc .............................   Passed    0.36 sec
+      Start 10: fastipc.mpmc.threaded_exactly_once
+10/27 Test #10: fastipc.mpmc.threaded_exactly_once .......   Passed    0.27 sec
+      Start 11: fastipc.mpmc.process_exactly_once
+11/27 Test #11: fastipc.mpmc.process_exactly_once ........   Passed    0.01 sec
+      Start 12: fastipc.mpmc.abandoned_reservation
+12/27 Test #12: fastipc.mpmc.abandoned_reservation .......   Passed    0.04 sec
+      Start 13: fastipc.uds
+13/27 Test #13: fastipc.uds ..............................   Passed    0.10 sec
+      Start 14: fastipc.benchmark_smoke
+14/27 Test #14: fastipc.benchmark_smoke ..................   Passed    0.39 sec
+      Start 15: fastipc.mpmc.benchmark_smoke
+15/27 Test #15: fastipc.mpmc.benchmark_smoke .............   Passed    0.03 sec
+      Start 16: fastipc.fault.peer_missing
+16/27 Test #16: fastipc.fault.peer_missing ...............   Passed    0.01 sec
+      Start 17: fastipc.fault.producer_crash
+17/27 Test #17: fastipc.fault.producer_crash .............   Passed    0.01 sec
+      Start 18: fastipc.fault.consumer_crash
+18/27 Test #18: fastipc.fault.consumer_crash .............   Passed    0.01 sec
+      Start 19: fastipc.fault.restart
+19/27 Test #19: fastipc.fault.restart ....................   Passed    0.01 sec
+      Start 20: fastipc.fault.slow_consumer
+20/27 Test #20: fastipc.fault.slow_consumer ..............   Passed    0.03 sec
+      Start 21: fastipc.fault.timeout
+21/27 Test #21: fastipc.fault.timeout ....................   Passed    0.04 sec
+      Start 22: fastipc.fault.malformed_header
+22/27 Test #22: fastipc.fault.malformed_header ...........   Passed    0.01 sec
+      Start 23: fastipc.fault.version_mismatch
+23/27 Test #23: fastipc.fault.version_mismatch ...........   Passed    0.01 sec
+      Start 24: fastipc.fault.stale_shared_memory
+24/27 Test #24: fastipc.fault.stale_shared_memory ........   Passed    0.31 sec
+      Start 25: fastipc.fault.queue_full
+25/27 Test #25: fastipc.fault.queue_full .................   Passed    0.04 sec
+      Start 26: fastipc.fault.queue_empty
+26/27 Test #26: fastipc.fault.queue_empty ................   Passed    0.03 sec
+      Start 27: fastipc.fault.rapid_restart
+27/27 Test #27: fastipc.fault.rapid_restart ..............   Passed    0.01 sec
+
+100% tests passed, 0 tests failed out of 27
+
+Label Time Summary:
+benchmark    =   0.42 sec*proc (2 tests)
+fault        =   0.77 sec*proc (18 tests)
+
+Total Test time (real) =   3.56 sec

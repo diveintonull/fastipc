@@ -197,3 +197,14 @@ smoke test 会解析每一行 JSON、检查统一 run ID、1P1C/2P2C coverage、
 - producer payload fill 与 consumer full validation 都在测量窗口内，因此是 touch-memory workload；
 - CPU utilization 汇总整个进程所有线程，可以超过 100%；
 - 该 benchmark 不证明 crash recovery；abandoned reservation 仍为 `INCOMPLETE`。
+
+### 9.1 最终实测证据
+
+revision `6d9c7549666b` 的 Release 构建在 WSL2 / GNU 13.3.0 上运行默认矩阵 3 trial，生成：
+
+- [原始 JSONL](../benchmarks/results/2026-08-21-mpmc-contention-wsl2-gcc13-6d9c754.jsonl)
+- SHA-256：`5307be6000d7850cf2a52a4587dd2451c585a2bc3bed3d34dc5b454e8268333b`
+
+文件包含 1 条 environment 与 27 条 result。jq 独立校验 9 个 case、每 case trial 1/2/3、统一 run ID、embedded revision、exact-count、零 missing/duplicate/checksum error/queue timeout 和 quantile order。汇总表见 [BENCHMARK_RESULTS.md](../BENCHMARK_RESULTS.md)，解释见 [performance-analysis.md](performance-analysis.md)。
+
+该证据只覆盖同进程线程 contention。跨进程 MPMC 由 correctness test 覆盖，但没有与这份性能数据混写。

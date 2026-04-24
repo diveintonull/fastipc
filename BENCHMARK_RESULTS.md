@@ -102,3 +102,40 @@ rigtorp SPSC 不包含跨进程 transport、映射、内核 IPC 或 peer failure
 TSan 在该 WSL2 kernel 下使用仓库已记录的 `setarch x86_64 -R` wrapper；不使用它时 runtime 会在测试逻辑前因 shadow-memory mapping 冲突退出。
 
 这些结果只描述所记录主机、固定顺序、未固定 CPU affinity、single-outstanding RTT workload。它们不是 native Linux、目标机器人硬件、NUMA、多 producer 或 saturated streaming 的性能承诺。
+
+## MPMC contention 增量结果
+
+MPMC contention 与上面的跨进程 ping-pong 回答不同问题，因此不并入 transport 排名。
+
+| 字段 | 值 |
+| --- | --- |
+| UTC | 2026-08-21T01:01:16Z |
+| Source revision | `6d9c7549666b6c064cce75dd6c4f19e34044dbfd` |
+| Raw JSONL | [2026-08-21-mpmc-contention-wsl2-gcc13-6d9c754.jsonl](benchmarks/results/2026-08-21-mpmc-contention-wsl2-gcc13-6d9c754.jsonl) |
+| Raw SHA-256 | `5307be6000d7850cf2a52a4587dd2451c585a2bc3bed3d34dc5b454e8268333b` |
+| Run ID | `2026-08-21T01:01:16Z-519863-83976042822471-6d9c7549666b` |
+| Build | Release，GNU 13.3.0 |
+| Host / kernel | `LAPTOP-NUKUM2JI`，WSL2，`6.6.87.2-microsoft-standard-WSL2` |
+| CPU | Intel Core Ultra 9 275HX，24 个 online logical CPU |
+| Workload | 同进程多线程、单 mapping、touch-memory、bounded MPMC copy |
+| Trial | 9 个逻辑 case，每个 3 轮；下表每项分别取三轮中位数 |
+
+原始文件共 28 行：1 条 `environment`、27 条 `result`。独立 jq 校验确认 9 个 case 均含 trial 1/2/3，所有记录共享同一 run ID，并且每条成功结果都满足 exact-count、零 missing、零 duplicate、零 checksum error、零 queue timeout 和分位数有序。
+
+| Topology | Payload | message/s | Payload MiB/s | P50 µs | P99 µs | P99.9 µs | CPU % |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1P1C | 64 B | 3,614,649.713 | 220.621 | 860.518 | 1,273.080 | 1,284.865 | 191.374 |
+| 1P1C | 1 KiB | 1,182,063.414 | 1,154.359 | 2,576.088 | 3,755.053 | 3,773.292 | 190.914 |
+| 1P1C | 64 KiB | 26,202.364 | 1,637.648 | 2,365.530 | 4,357.677 | 4,402.277 | 174.386 |
+| 2P2C | 64 B | 4,638,585.213 | 283.117 | 690.860 | 974.882 | 1,009.591 | 372.880 |
+| 2P2C | 1 KiB | 2,059,321.797 | 2,011.056 | 1,896.437 | 2,289.138 | 2,319.356 | 381.771 |
+| 2P2C | 64 KiB | 52,527.926 | 3,282.995 | 1,453.872 | 3,137.758 | 3,161.218 | 364.148 |
+| 4P4C | 64 B | 3,940,458.257 | 240.506 | 941.518 | 1,090.787 | 1,118.435 | 779.907 |
+| 4P4C | 1 KiB | 3,527,135.535 | 3,444.468 | 991.737 | 1,496.783 | 1,551.502 | 775.339 |
+| 4P4C | 64 KiB | 101,328.294 | 6,333.018 | 538.926 | 1,684.081 | 1,712.643 | 761.924 |
+
+本机结果显示：64 B 在 2P2C 达到最高中位 message/s，4P4C 反而下降，说明小消息的 cursor/cache-line 竞争已经抵消额外线程；64 KiB 则从 1P1C 到 4P4C 提升约 3.87 倍，因为 payload fill、copy 和 full validation 可以跨核并行。
+
+这里的 latency 是 producer 填充 header 后到 consumer 完成接收的队列 E2E 时间，包含排队与 copy；这是饱和争用 workload，不是单次 CAS 延迟。CPU 汇总进程内所有 worker，所以 4P4C 接近 800% 合理。peak RSS 和 context switch 保留在 raw JSONL，不从单次 WSL2 运行外推产品结论。
+
+本 benchmark 不含多进程调度、固定 affinity、NUMA、governor、case randomization 或 crash recovery。producer 在 reservation 后退出仍会留下 FIFO hole，状态保持 `INCOMPLETE`。

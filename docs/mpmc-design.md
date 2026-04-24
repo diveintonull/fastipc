@@ -96,3 +96,23 @@ does not yet provide full robust recovery.
 - cursor 的模数比较假设活动位置距离小于 `2^63`；持续运行超过该边界尚未验证。
 - 不提供多订阅 fan-out；每条消息只由一个 consumer 获取。
 - `Close` 不回收其他 participant 的未完成 reservation，也不宣称 crash safety。
+
+## 9. 验证快照
+
+实现 revision：`6d9c7549666b6c064cce75dd6c4f19e34044dbfd`。
+
+五套全量 CTest：
+
+| 配置 | 结果 | 日志 |
+| --- | ---: | --- |
+| Debug | 27/27 | [日志](../tests/results/2026-08-21-debug-6d9c754.log) |
+| Release | 27/27 | [日志](../tests/results/2026-08-21-release-6d9c754.log) |
+| ASan | 27/27 | [日志](../tests/results/2026-08-21-asan-6d9c754.log) |
+| UBSan | 27/27 | [日志](../tests/results/2026-08-21-ubsan-6d9c754.log) |
+| TSan | 27/27 | [日志](../tests/results/2026-08-21-tsan-6d9c754.log) |
+
+合计 135/135；sanitizer 日志无报告。MPMC 定向路径还在当前源码上独立通过 Debug 5/5、ASan 5/5、UBSan 5/5、TSan 5/5。
+
+正式 Release contention 原始文件为 [JSONL](../benchmarks/results/2026-08-21-mpmc-contention-wsl2-gcc13-6d9c754.jsonl)，SHA-256 `5307be6000d7850cf2a52a4587dd2451c585a2bc3bed3d34dc5b454e8268333b`。1P1C/2P2C/4P4C × 64 B/1 KiB/64 KiB × 3 trial 共 27 条 result，全部 exact-count、零 missing/duplicate/checksum error/queue timeout。
+
+这些证据支持正常执行期间的并发正确性与已测争用行为。它们不改变第 7 节的 crash 边界：abandoned producer reservation recovery 仍为 `INCOMPLETE`。

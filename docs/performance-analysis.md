@@ -120,7 +120,7 @@ context switch 对解释状态切换很有帮助，但不能单独代表效率�
 - 没有固定 CPU affinity；
 - case 顺序未随机化；
 - WSL2 不是目标机器人 native Linux；
-- 没有 NUMA、contention、MPMC 或多 client；
+- 该组 transport RTT 数据没有 NUMA、contention、MPMC 或多 client；MPMC contention 在第 9 节单列；
 - `touch_memory` 仍不包含业务序列化与算法。
 
 所以这些数字适合验证 benchmark harness、寻找 break-even 与提出下一轮假设，不适合作 SLA 或营销数字。
@@ -134,7 +134,23 @@ context switch 对解释状态切换很有帮助，但不能单独代表效率�
 3. 对 4 KiB–1 MiB 做 active-spin budget sweep；
 4. 增加 saturated streaming 与多 outstanding，但与 RTT 表分开；
 5. 实现并验证 iceoryx adapter 后再加入相同 schema；
-6. MPMC 完成后单列 producer/consumer contention matrix；
+6. 在 native Linux 上为 MPMC 增加 affinity、NUMA 与 producer/consumer 比例 sweep；
 7. 用 `perf stat/record` 对 copy、scan、futex、scheduler 热点做归因。
 
 任何下一轮都应继续保存原始 JSONL，不只保存汇总表。
+
+## 9. MPMC contention 结果解释
+
+revision `6d9c7549666b` 的 Release runner 完成 1P1C、2P2C、4P4C × 64 B、1 KiB、64 KiB，每个 case 3 trial。原始 [JSONL](../benchmarks/results/2026-08-21-mpmc-contention-wsl2-gcc13-6d9c754.jsonl) 的 SHA-256 为 `5307be6000d7850cf2a52a4587dd2451c585a2bc3bed3d34dc5b454e8268333b`；27 条结果全部 exact-count，missing/duplicate/checksum error 和 queue timeout 均为 0。
+
+主要观察：
+
+- 64 B 的中位吞吐从 1P1C 的 3.61 M message/s 上升到 2P2C 的 4.64 M，4P4C 回落到 3.94 M；共享 enqueue/dequeue cursor 与 sequence cache-line 竞争在小消息下已经可见。
+- 1 KiB 的 4P4C 中位吞吐为 3.53 M message/s、3,444 MiB/s，仍能受益于更多 worker。
+- 64 KiB 从 1P1C 的 1,638 MiB/s、2P2C 的 3,283 MiB/s 到 4P4C 的 6,333 MiB/s；这包含 producer 全量填充、queue copy 和 consumer 全量验证，不能只归因于队列算法。
+- 4P4C 的 CPU 中位数约 775%–780%，与 8 个忙碌 worker 的进程级汇总一致；它不是“单核超过 100%”。
+- P50/P99 是发送时间戳到接收完成的 E2E queue residence。队列在饱和模式下允许 backlog，因此毫秒级尾延迟不能与前文 single-outstanding RTT 的微秒数字直接比较。
+
+这轮数据足以证明 runner、并发计数与 contention 路径可工作，也能提出 cache contention 假设；但只有 3 trial、固定 case 顺序、未固定 affinity，不能给出稳定置信区间。WSL2、同进程单 mapping 还排除了多进程调度与真实机器人部署因素。
+
+算法正确性和 crash robustness 也必须分开：正常并发由线程/跨进程 exact-once 测试与 TSan 支持；producer 在 CAS reservation 后、sequence publication 前退出仍会阻塞 FIFO 队首，没有 recovery proof，因此保持 `INCOMPLETE`。

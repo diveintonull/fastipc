@@ -145,3 +145,43 @@ ASan、UBSan、TSan 分别在 `CMAKE_CXX_FLAGS` 中加入对应 `-fsanitize=...`
 benchmark smoke 机器校验 environment/baseline/result record 数、统一 run ID、schema、case/trial/status、精确 RTT/消息/字节公式、quantile 顺序、iceoryx unavailable 无假 result、显式 unavailable exit 3、strict-mode exit 3，以及两轮 trial identity。
 
 该 WSL2 的 GCC TSan 仍使用 `setarch x86_64 -R`；直接运行会在测试代码开始前因 shadow-memory mapping conflict 退出。最终 TSan 日志来自 wrapper 下的真实 22/22，不包含 suppression。
+
+## 2026-08-21 有界 MPMC 增量验证
+
+本节记录独立 MPMC layout、CAS reservation、per-slot sequence、futex epoch、跨线程/跨进程 exact-once、abandoned reservation 限制刻画与 contention runner 进入本地提交后的完整矩阵。
+
+| 字段 | 值 |
+| --- | --- |
+| Revision | `6d9c7549666b6c064cce75dd6c4f19e34044dbfd` |
+| 主机 / 内核 | WSL2 / `6.6.87.2-microsoft-standard-WSL2` |
+| 编译器 | GNU 13.3.0 |
+| CTest | 每种配置 27 项；`fault` 标签 18 项，`benchmark` 标签 2 项 |
+| 合计 | 135/135 |
+
+| 配置 | Sanitizer 参数 | 通过 | 失败 | 原始日志 | SHA-256 |
+| --- | --- | ---: | ---: | --- | --- |
+| Debug | 无 | 27 | 0 | [日志](tests/results/2026-08-21-debug-6d9c754.log) | `8460368f0dfb5006e5b2d188c630dc7d934d2768c329cc5d87a76f77751ef696` |
+| Release | 无 | 27 | 0 | [日志](tests/results/2026-08-21-release-6d9c754.log) | `ec7338a8d3e734fd1069c16d8dcdcbc82c05dfdfb82cac87854e61d3180f8f48` |
+| ASan | `halt_on_error=1:detect_leaks=1` | 27 | 0 | [日志](tests/results/2026-08-21-asan-6d9c754.log) | `032a0e22f09846b30454454517d8ece5b6e25fb0ce0a233500991984582f9593` |
+| UBSan | `halt_on_error=1:print_stacktrace=1` | 27 | 0 | [日志](tests/results/2026-08-21-ubsan-6d9c754.log) | `6cba800930f4613be761a2e0be9e70b9182909d17b00d2e2ecb34d6f660e20c6` |
+| TSan | `halt_on_error=1:second_deadlock_stack=1` | 27 | 0 | [日志](tests/results/2026-08-21-tsan-6d9c754.log) | `7df560eb8e8c5727471f947e1d31c217b4a6e5076ced33bb442b83a8e48d07e3` |
+
+相对上一轮 22 项矩阵新增 5 个 registered entry：
+
+1. `fastipc.mpmc`：聚合执行参数、FIFO、背压、futex、线程、进程与故障刻画；
+2. `fastipc.mpmc.threaded_exactly_once`：4P4C × 每 producer 2,000 条；
+3. `fastipc.mpmc.process_exactly_once`：3P3C × 每 producer 500 条、独立 `Open` mapping；
+4. `fastipc.mpmc.abandoned_reservation`：producer 只推进 enqueue cursor 后退出，后续消息可 publish，但 FIFO consumer 超时；
+5. `fastipc.mpmc.benchmark_smoke`：JSON schema、统一 run ID、1P1C/2P2C、exact-count、quantile order 和两 trial identity。
+
+五种配置都运行完整 27 项，而不是只跑 MPMC filter。日志机器检查结果：
+
+- 每份均包含 `100% tests passed, 0 tests failed out of 27`；
+- ASan/LSan 无 error 或 leak report；
+- UBSan 无 runtime error；
+- TSan 无 warning/summary，且没有 suppression；
+- Debug、Release 与三类 sanitizer 合计 135/135。
+
+TSan 在本机继续用 `setarch x86_64 -R` 避免 WSL2 shadow-memory mapping 冲突；这是运行环境包装，不是数据竞争 suppression。
+
+`abandoned_reservation` 是失败语义表征：它证明当前会产生队首阻塞，也证明实现没有假装跳过或回收未发布 slot。它不证明 crash recovery；完整 robust recovery 仍为 `INCOMPLETE`。
