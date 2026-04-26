@@ -7,6 +7,7 @@ find_package(Threads REQUIRED)
 
 option(FASTIPC_BUILD_TESTS "Build FastIPC behavior tests" ON)
 option(FASTIPC_BUILD_BENCHMARKS "Build the FastIPC benchmark runner" ON)
+option(FASTIPC_BUILD_CHAOS_RUNNER "Build the seeded FastIPC chaos runner" ON)
 
 add_library(
     fastipc
@@ -112,6 +113,63 @@ if(FASTIPC_BUILD_BENCHMARKS)
 
 endif()
 
+if(FASTIPC_BUILD_CHAOS_RUNNER)
+    set(FASTIPC_CHAOS_SOURCE_REVISION "unknown")
+    find_package(Git QUIET)
+    if(Git_FOUND)
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} rev-parse --short=12 HEAD
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            OUTPUT_VARIABLE FASTIPC_CHAOS_SOURCE_REVISION
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+    endif()
+    add_library(
+        fastipc_chaos_support
+        STATIC
+            chaos/chaos_runner.cpp
+            chaos/chaos_process_runner.cpp)
+    target_include_directories(
+        fastipc_chaos_support
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(
+        fastipc_chaos_support
+        PUBLIC FastIPC::fastipc Threads::Threads)
+    target_compile_features(fastipc_chaos_support PUBLIC cxx_std_20)
+    target_compile_definitions(
+        fastipc_chaos_support
+        PRIVATE
+            FASTIPC_CHAOS_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+            FASTIPC_CHAOS_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+            FASTIPC_CHAOS_SOURCE_REVISION="${FASTIPC_CHAOS_SOURCE_REVISION}")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            fastipc_chaos_support
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+                -Wconversion
+                -Wsign-conversion)
+    endif()
+    add_executable(
+        fastipc_chaos_runner
+        chaos/chaos_main.cpp)
+    target_link_libraries(
+        fastipc_chaos_runner
+        PRIVATE fastipc_chaos_support)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            fastipc_chaos_runner
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+                -Wconversion
+                -Wsign-conversion)
+    endif()
+endif()
+
 if(BUILD_TESTING AND FASTIPC_BUILD_TESTS)
     add_executable(fastipc_tests tests/transport_test.cpp)
     target_link_libraries(fastipc_tests PRIVATE FastIPC::fastipc Threads::Threads)
@@ -215,6 +273,42 @@ if(BUILD_TESTING AND FASTIPC_BUILD_TESTS)
                 -Wsign-conversion)
     endif()
     add_test(NAME fastipc.uds COMMAND fastipc_uds_tests)
+
+    if(FASTIPC_BUILD_CHAOS_RUNNER)
+        add_executable(fastipc_chaos_tests tests/chaos_test.cpp)
+        target_link_libraries(
+            fastipc_chaos_tests
+            PRIVATE fastipc_chaos_support)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(
+                fastipc_chaos_tests
+                PRIVATE
+                    -Wall
+                    -Wextra
+                    -Wpedantic
+                    -Wconversion
+                    -Wsign-conversion)
+        endif()
+        add_test(NAME fastipc.chaos.plan COMMAND fastipc_chaos_tests)
+        add_test(
+            NAME fastipc.chaos.summary
+            COMMAND fastipc_chaos_tests --seeded-summary)
+        add_test(
+            NAME fastipc.chaos.seeded_smoke
+            COMMAND fastipc_chaos_runner
+                    --self-test
+                    --seed 20260821
+                    --run-id ctest-seeded-smoke)
+        set_tests_properties(
+            fastipc.chaos.plan
+            PROPERTIES LABELS chaos)
+        set_tests_properties(
+            fastipc.chaos.summary
+            PROPERTIES LABELS "chaos;fault" TIMEOUT 30)
+        set_tests_properties(
+            fastipc.chaos.seeded_smoke
+            PROPERTIES LABELS "chaos;fault" TIMEOUT 30)
+    endif()
 
     if(FASTIPC_BUILD_BENCHMARKS)
         add_test(

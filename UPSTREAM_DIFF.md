@@ -23,11 +23,14 @@
 
 ## 当前构建边界
 
-`CMakeLists.txt` 现在只暴露：
+`CMakeLists.txt` 当前构建：
 
-- `FastIPC::fastipc`，由 `src/shared_memory_transport.cpp`、`src/unix_domain_socket_transport.cpp`、`src/status.cpp` 构建；
-- 两个当前 behavior/fault test executable；
-- 当前 cross-process benchmark executable。
+- public `FastIPC::fastipc`：SPSC shared memory、MPMC shared memory、UDS 与 typed status；
+- behavior/fault executable：`fastipc_tests`、`fastipc_zero_copy_tests`、`fastipc_mpmc_tests`、`fastipc_uds_tests`；
+- benchmark executable：`fastipc_benchmark` 与 `fastipc_mpmc_benchmark`；
+- 测试工具：`fastipc_chaos_runner`、`fastipc_chaos_tests` 和内部 `fastipc_chaos_support`。
+
+Chaos support 只链接 public `FastIPC::fastipc` 并位于 `chaos/`；匿名 pipe 只传控制命令和结果，业务 payload 必须经过 `SharedMemoryTransport::Loan/Publish/Take/Release`。它没有进入 `include/fastipc/`，因此不会把故障编排概念泄漏进 transport API。
 
 导入的 `include/libsharedmemory`、`example`、`ffi`、`test`、screenshot、legacy changelog 仍保留用于历史审阅，不进入当前 build，也不算 FastIPC behavior。没有单独 destructive-file approval，因此未做广泛删除。
 
@@ -69,9 +72,12 @@
 | Hostile-input validation | wire magic/version/flags/length 与 required memfd seal | UDS receive path、hostile-input test |
 | Fault automation | 12 个命名 cross-process shared-memory fault，加 UDS disconnect/corruption | `CMakeLists.txt`、`tests/`、`docs/fault-matrix.md` |
 | Benchmark | shared memory、UDS、pipe；64 B–1 MiB；throughput、P50/P95/P99、CPU、context switch、memory | `benchmarks/`、`BENCHMARK_RESULTS.md` |
+| 零拷贝 chunk ownership | move-only `Loan/Publish/Take/Release`、逐槽 generation/owner/state、进程死亡回收 | `shared_memory_transport.hpp`、`docs/chunk-lifecycle.md` |
+| MPMC 正常并发 | 独立 layout、CAS reservation、per-slot sequence、futex epoch；不谎称 abandoned reservation crash-safe | `mpmc_shared_memory_transport.cpp`、`docs/mpmc-design.md` |
+| Seeded Chaos | 独立 producer/consumer actor、八操作 seed permutation、逐操作恢复探针、增量 JSONL 与阈值 | `chaos/`、`tests/chaos_test.cpp`、`docs/chaos-testing.md` |
 | Performance engineering | raw non-root perf evidence、rejected probe-only result、bounded-spin 与 heartbeat ownership experiment | `benchmarks/profiling/` |
 | Verification matrix | Debug/Release/ASan/UBSan/TSan automation 与固定 revision raw log | workflow、`TEST_MATRIX.md` |
-| 设计与代码证据 | memory-model proof、module guide、代码锚点 | `docs/` |
+| 设计与代码证据 | memory-model proof、module guide、Chaos 诊断、代码锚点 | `docs/` |
 
 ## Commit-level 证据
 
@@ -100,4 +106,4 @@ compiled core 没有两者源码。以后若真正 copy/adapt code，而非只�
 
 ## 明确不作的声明
 
-FastIPC 不声称 MPSC/MPMC、portable ISO C++ process-shared atomic、public zero-copy loan ownership、authentication/encryption、hard real-time latency、crash-proof mid-instruction recovery、production security review，也不把 WSL2 结果当成 native-hardware performance。这些是明确的未来设计问题，不是暗示存在的能力。
+FastIPC 不声称 MPSC、fan-out、MPMC abandoned-reservation crash recovery、portable ISO C++ process-shared atomic、authentication/encryption、hard real-time latency、任意指令点 crash-proof recovery、production security review，也不把 WSL2 短测或性能结果当成 native-hardware 长时稳定性。这些是明确边界，不是暗示存在的能力。

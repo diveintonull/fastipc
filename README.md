@@ -23,6 +23,8 @@ FastIPC 是 Linux C++20 IPC library，基于 `kyr0/libsharedmemory` 深度派生
 - Pipe、UDS、FastIPC Copy、FastIPC Zero-copy 四种真实 baseline；iceoryx 缺失时输出机器可读 unavailable，不伪造结果；
 - schema v1 JSONL，包含 run/case/trial identity、精确消息/字节计数、P50/P95/P99/P99.9/MAX、CPU、context switch、RSS；
 - 自动 Debug、Release、ASan、UBSan、TSan 覆盖。
+- 可复现的 seeded `ChaosRunner`：八类故障按 seed 洗牌，producer/consumer 为独立进程，每步输出增量 JSONL；
+- 每次故障后执行恢复探针，并核对 checksum、lost、duplicate、unexpected timeout、RSS 增长与 P99 漂移。
 
 ## 架构
 
@@ -81,6 +83,9 @@ ctest --test-dir build --output-on-failure
 - `fastipc_uds_tests`：Unix-socket behavior/hostile-input executable；
 - `fastipc_benchmark`：跨进程 transport JSONL benchmark runner；
 - `fastipc_mpmc_benchmark`：1P1C/2P2C/4P4C contention JSONL runner。
+- `fastipc_chaos_runner`：可配置 seed、操作数、最短时长和阈值的跨进程故障编排器；
+- `fastipc_chaos_tests`：确定性计划和八操作精确汇总断言；
+- `fastipc_chaos_support`：只供测试工具使用的内部 static library，不是 public transport API。
 
 ## Shared-memory 示例
 
@@ -202,6 +207,7 @@ peer->Receive(
 - [两轮 perf 实验与原始 stat/record/report](benchmarks/profiling/README.md)
 - [五种配置测试矩阵与原始 CTest 日志](TEST_MATRIX.md)
 - [故障矩阵](docs/fault-matrix.md)
+- [Seeded Chaos / Soak 设计、复现与证据边界](docs/chaos-testing.md)
 - [内存序审计](docs/memory-model.md)
 - [上游审计](docs/upstream-analysis.md)
 - [准确的上游/衍生边界](UPSTREAM_DIFF.md)
@@ -260,4 +266,5 @@ does not yet provide full robust recovery.
 - 没有 authentication、encryption、namespace broker、SELinux policy integration、NUMA placement 或 real-time scheduling guarantee。
 - UDS sealed-memfd 是 descriptor-assisted shared memory，不是 pure socket-copy throughput。
 - iceoryx baseline 当前为 INCOMPLETE；依赖和专用 adapter 都可复核前不得产生数值结果。
+- 30 分钟、2 小时、overnight 与 24 小时 soak 必须分别保留固定 revision 原始 JSONL 才能声称完成；短 CTest 不等于长时稳定性。
 - 部署决策前必须在 native Linux 与 target hardware 重测 WSL2 数据。

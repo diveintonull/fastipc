@@ -26,6 +26,25 @@
 
 聚合测试还覆盖 duplicate producer/consumer、idle-heartbeat false-takeover prevention、stale-consumer role-token fencing、graceful-close wakeup、message exchange 与 2,000-message epoch stress。
 
+## Seeded Chaos 序列
+
+`fastipc_chaos_runner` 不替代上面的单故障测试；它把公开 API 场景串成可复现的长序列，并在每个操作后先排空 outstanding message，再做一次 publish/take 恢复探针。
+
+| 操作 | 注入点 | 操作内必须证明 |
+| --- | --- | --- |
+| `KillProducer` | child 已 `Loan` 但未 `Publish` 时 `SIGKILL` | replacement producer 回收 abandoned mutable loan；恢复探针通过 |
+| `KillConsumer` | child 已 `Take` 且未 `Release` 时 `SIGKILL` | replacement consumer 重投递并校验同一 sequence/payload |
+| `RestartProducer` | producer graceful stop 后重新打开同一 segment | generation/reclaim 后数据流恢复 |
+| `RestartConsumer` | consumer graceful stop 后重新打开同一 segment | role 重领后数据流恢复 |
+| `SlowConsumer` | ring 填满，consumer 延迟 release | blocked producer 经 space epoch 唤醒，所有 sequence 被顺序消费 |
+| `QueuePressure` | ring 填满后分别使用 `Drop` 与 finite `Timeout` | 返回精确 typed status，两个统计 counter 都增加 |
+| `Timeout` | live 但为空的 channel 上 finite `Take` | 返回 expected `Timeout`，receive-timeout counter 增加 |
+| `DelayWakeup` | consumer 先阻塞，延迟 publish | data epoch 唤醒，无 lost wakeup，payload 校验通过 |
+
+每个完整 8 操作周期都是八类操作的 seed-shuffled permutation。相同 seed 和 operation count 产生相同操作顺序；Linux 调度时序不因此变成 deterministic。逐行证据与长时边界见 [chaos-testing.md](chaos-testing.md)。
+
+当前 `fault` 标签共有 20 个 registered entry：17 个 SPSC/零拷贝直接故障、1 个 MPMC abandoned-reservation 限制测试、`fastipc.chaos.summary` 与 `fastipc.chaos.seeded_smoke`。Chaos 两项会串行覆盖八类操作，不能把它们再按“八个独立 CTest”相加。
+
 ## 复现
 
 ```bash
@@ -35,4 +54,4 @@ ctest --test-dir build --output-on-failure
 ctest --test-dir build -L fault --output-on-failure
 ```
 
-`fault` 标签包含规格要求的 12 类基础场景，并加入 5 类零拷贝 ownership 故障，共 17 个独立 CTest。未标记该标签的 `fastipc.transport` 在单进程中运行覆盖面更广的聚合测试。
+`fastipc.transport`、`fastipc.zero_copy` 与 `fastipc.mpmc` 是覆盖面更广的聚合测试；registered entry、内部 case 和一次 Chaos 序列是三个不同层级，报告时必须分开。
