@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -29,6 +30,34 @@ enum class Operation : std::uint8_t {
 
 [[nodiscard]] std::vector<Operation> GenerateOperationPlan(
     std::uint64_t seed, std::size_t operation_count);
+
+enum class DeliveryClassification : std::uint8_t {
+  Ok,
+  Duplicate,
+  Unexpected,
+};
+
+class SequenceLedger {
+ public:
+  [[nodiscard]] std::uint64_t NextCandidate() const noexcept;
+  [[nodiscard]] bool RecordPublished(std::uint64_t sequence);
+  [[nodiscard]] DeliveryClassification RecordConsumed(
+      std::uint64_t observed_sequence,
+      std::uint64_t expected_sequence) noexcept;
+
+  [[nodiscard]] std::size_t outstanding_count() const noexcept {
+    return outstanding_.size();
+  }
+  [[nodiscard]] std::size_t maximum_outstanding_count() const noexcept {
+    return maximum_outstanding_count_;
+  }
+
+ private:
+  std::deque<std::uint64_t> outstanding_;
+  std::uint64_t last_published_sequence_{0U};
+  std::uint64_t last_consumed_sequence_{0U};
+  std::size_t maximum_outstanding_count_{0U};
+};
 
 struct RunnerConfig {
   std::uint64_t seed{20260821U};

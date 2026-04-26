@@ -31,10 +31,11 @@ ChaosRunner  ----------------------------> Producer child
 
 匿名 pipe 只承载固定大小的控制命令和 `Status`/counter report。sequence、payload 和 checksum 始终走 public `SharedMemoryTransport` 零拷贝接口，不能因为测试方便绕过 data plane。
 
-父进程拥有 fault oracle：
+父进程拥有有界 fault oracle：
 
-- `outstanding`：已成功 publish、尚未成功 consume 的 sequence；
-- `consumed`：已消费 sequence，用于发现 duplicate；
+- `SequenceLedger` 要求成功 publish 的 sequence 连续单调；
+- deque 只保留当前已 publish、尚未 consume 的 sequence，历史消息不会累积；
+- `last_consumed_sequence` 单调标量仍能识别任意久以前的 duplicate；
 - payload 前 8 字节是 little-endian sequence，末 8 字节是 FNV-1a checksum，中间字节由 sequence 确定性生成；
 - 每项操作结束必须没有 outstanding message，然后执行一次 publish/take 恢复探针。
 
@@ -116,6 +117,8 @@ expected_drops
 operation_failures
 cleanup_failures
 actual_duration_ms
+sequence_tracker_mode
+maximum_outstanding_messages
 baseline_p99_us
 final_p99_us
 p99_drift_us
@@ -125,7 +128,7 @@ maximum_rss_kib
 memory_growth_kib
 ```
 
-RSS 读取 `/proc/<pid>/statm` 的 resident pages 并汇总父进程和两个 actor。它适合发现明显无界增长，不是 allocator leak proof；ASan/LSan 仍需独立运行。baseline/final P99 分别取探针序列首尾窗口；短跑样本少，因此只能用于回归门槛，不能做容量规划。
+RSS 读取 `/proc/<pid>/statm` 的 resident pages 并汇总父进程和两个 actor。Sequence ledger 的存储上限由当前 outstanding 数决定；summary 同时输出观测到的最大值，避免 runner 自己用全历史集合制造伪内存增长。RSS 仍只适合发现明显无界增长，不是 allocator leak proof；ASan/LSan 需独立运行。baseline/final P99 分别取探针序列首尾窗口；短跑样本少，因此只能用于回归门槛，不能做容量规划。
 
 ## 通过条件与退出码
 

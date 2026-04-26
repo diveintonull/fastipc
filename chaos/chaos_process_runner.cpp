@@ -29,7 +29,6 @@
 #include <sys/wait.h>
 #include <thread>
 #include <type_traits>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <unistd.h>
@@ -921,16 +920,16 @@ struct Runner::Impl {
     return status;
   }
 
-  [[nodiscard]] std::uint64_t NextSequence() noexcept {
-    return next_sequence++;
+  [[nodiscard]] std::uint64_t NextSequence() const noexcept {
+    return sequence_ledger.NextCandidate();
   }
 
   [[nodiscard]] Status TrackPublished(std::uint64_t sequence) {
-    if (!outstanding.insert(sequence).second) {
-      ++counters.duplicate_messages;
+    if (!sequence_ledger.RecordPublished(sequence)) {
+      ++counters.unexpected_messages;
       return Status(
           StatusCode::CorruptData,
-          "publisher reused an outstanding sequence");
+          "publisher sequence was not contiguous");
     }
     return Status::Ok();
   }
@@ -954,36 +953,30 @@ struct Runner::Impl {
 
   [[nodiscard]] Status VerifyConsumed(
       const WireReport& report,
-      std::optional<std::uint64_t> expected_sequence) {
+      std::uint64_t expected_sequence) {
     if (report.checksum_match == 0U) {
       ++counters.checksum_mismatches;
       return Status(
           StatusCode::CorruptData,
           "consumed payload checksum mismatch");
     }
-    if (expected_sequence && report.sequence != *expected_sequence) {
-      ++counters.unexpected_messages;
-      return Status(
-          StatusCode::CorruptData,
-          "consumed sequence did not match FIFO expectation");
+    const auto classification = sequence_ledger.RecordConsumed(
+        report.sequence, expected_sequence);
+    switch (classification) {
+      case DeliveryClassification::Ok:
+        return Status::Ok();
+      case DeliveryClassification::Duplicate:
+        ++counters.duplicate_messages;
+        return Status(
+            StatusCode::CorruptData,
+            "sequence was delivered more than once");
+      case DeliveryClassification::Unexpected:
+        ++counters.unexpected_messages;
+        return Status(
+            StatusCode::CorruptData,
+            "consumed sequence was unpublished or out of FIFO order");
     }
-    if (consumed.contains(report.sequence)) {
-      ++counters.duplicate_messages;
-      return Status(
-          StatusCode::CorruptData,
-          "sequence was delivered more than once");
-    }
-    const auto outstanding_position =
-        outstanding.find(report.sequence);
-    if (outstanding_position == outstanding.end()) {
-      ++counters.unexpected_messages;
-      return Status(
-          StatusCode::CorruptData,
-          "consumer delivered an unpublished sequence");
-    }
-    outstanding.erase(outstanding_position);
-    consumed.insert(report.sequence);
-    return Status::Ok();
+    return Status(StatusCode::CorruptData, "unknown delivery classification");
   }
 
   [[nodiscard]] Status Publish(
@@ -1012,7 +1005,7 @@ struct Runner::Impl {
   }
 
   [[nodiscard]] Status Consume(
-      std::optional<std::uint64_t> expected_sequence,
+      std::uint64_t expected_sequence,
       std::chrono::milliseconds timeout,
       WireReport* observed_report = nullptr) {
     WireReport report;
@@ -1382,7 +1375,7 @@ struct Runner::Impl {
   }
 
   [[nodiscard]] Result<double> RecoveryProbe() {
-    if (!outstanding.empty()) {
+    if (sequence_ledger.outstanding_count() != 0U) {
       return Status(
           StatusCode::CorruptData,
           "operation left messages outstanding before recovery probe");
@@ -1501,7 +1494,8 @@ struct Runner::Impl {
          << counters.duplicate_messages
          << ",\"unexpected_timeouts\":"
          << counters.unexpected_timeouts
-         << ",\"outstanding_messages\":" << outstanding.size()
+         << ",\"outstanding_messages\":"
+         << sequence_ledger.outstanding_count()
          << ",\"total_rss_kib\":";
     if (rss) {
       line << *rss;
@@ -1538,9 +1532,7 @@ struct Runner::Impl {
   EndpointProcess producer;
   EndpointProcess consumer;
   Counters counters;
-  std::uint64_t next_sequence{1U};
-  std::unordered_set<std::uint64_t> outstanding;
-  std::unordered_set<std::uint64_t> consumed;
+  SequenceLedger sequence_ledger;
   std::vector<double> probe_latencies_us;
   bool has_run{false};
 };
@@ -1712,7 +1704,7 @@ Status Runner::Run(std::ostream& output, std::ostream* mirror) {
   impl_->UnlinkChannel();
 
   const auto lost_messages =
-      static_cast<std::uint64_t>(impl_->outstanding.size());
+      static_cast<std::uint64_t>(impl_->sequence_ledger.outstanding_count());
   const auto window =
       std::min(
           impl_->config.latency_window,
@@ -1796,6 +1788,9 @@ Status Runner::Run(std::ostream& output, std::ostream* mirror) {
           << impl_->counters.operation_failures
           << ",\"cleanup_failures\":"
           << impl_->counters.cleanup_failures
+          << ",\"sequence_tracker_mode\":\"contiguous_fifo\""
+          << ",\"maximum_outstanding_messages\":"
+          << impl_->sequence_ledger.maximum_outstanding_count()
           << ",\"actual_duration_ms\":" << duration_ms
           << ",\"probe_samples\":"
           << impl_->probe_latencies_us.size()

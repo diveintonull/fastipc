@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <random>
 
 namespace fastipc::chaos {
@@ -53,6 +54,41 @@ std::vector<Operation> GenerateOperationPlan(
                 cycle.begin() + static_cast<std::ptrdiff_t>(count));
   }
   return plan;
+}
+
+std::uint64_t SequenceLedger::NextCandidate() const noexcept {
+  if (last_published_sequence_ ==
+      std::numeric_limits<std::uint64_t>::max()) {
+    return 0U;
+  }
+  return last_published_sequence_ + 1U;
+}
+
+bool SequenceLedger::RecordPublished(std::uint64_t sequence) {
+  if (sequence == 0U || sequence != NextCandidate()) {
+    return false;
+  }
+  outstanding_.push_back(sequence);
+  last_published_sequence_ = sequence;
+  maximum_outstanding_count_ =
+      std::max(maximum_outstanding_count_, outstanding_.size());
+  return true;
+}
+
+DeliveryClassification SequenceLedger::RecordConsumed(
+    std::uint64_t observed_sequence,
+    std::uint64_t expected_sequence) noexcept {
+  if (observed_sequence <= last_consumed_sequence_) {
+    return DeliveryClassification::Duplicate;
+  }
+  if (observed_sequence != expected_sequence ||
+      outstanding_.empty() ||
+      outstanding_.front() != observed_sequence) {
+    return DeliveryClassification::Unexpected;
+  }
+  outstanding_.pop_front();
+  last_consumed_sequence_ = observed_sequence;
+  return DeliveryClassification::Ok;
 }
 
 }  // namespace fastipc::chaos

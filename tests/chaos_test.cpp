@@ -50,6 +50,24 @@ int DeterministicPlanCoversEveryOperation() {
   return 0;
 }
 
+int SequenceLedgerKeepsOnlyBoundedOutstandingState() {
+  fastipc::chaos::SequenceLedger ledger;
+  constexpr std::size_t kIterations = 1000000U;
+  for (std::size_t index = 0U; index < kIterations; ++index) {
+    const auto sequence = ledger.NextCandidate();
+    CHECK(ledger.NextCandidate() == sequence);
+    CHECK(ledger.RecordPublished(sequence));
+    CHECK(ledger.outstanding_count() == 1U);
+    CHECK(ledger.RecordConsumed(sequence, sequence) ==
+          fastipc::chaos::DeliveryClassification::Ok);
+    CHECK(ledger.outstanding_count() == 0U);
+  }
+  CHECK(ledger.maximum_outstanding_count() == 1U);
+  CHECK(ledger.RecordConsumed(1U, 1U) ==
+        fastipc::chaos::DeliveryClassification::Duplicate);
+  return 0;
+}
+
 std::size_t CountOccurrences(
     std::string_view text, std::string_view needle) {
   std::size_t count = 0U;
@@ -103,6 +121,10 @@ int SeededRunProducesExactSummary() {
   CHECK(output.find("\"unexpected_timeouts\":0") != std::string::npos);
   CHECK(output.find("\"operation_failures\":0") != std::string::npos);
   CHECK(output.find("\"cleanup_failures\":0") != std::string::npos);
+  CHECK(output.find("\"sequence_tracker_mode\":\"contiguous_fifo\"") !=
+        std::string::npos);
+  CHECK(output.find("\"maximum_outstanding_messages\":3") !=
+        std::string::npos);
   return 0;
 }
 
@@ -112,5 +134,9 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--seeded-summary") {
     return SeededRunProducesExactSummary();
   }
-  return DeterministicPlanCoversEveryOperation();
+  const auto plan_result = DeterministicPlanCoversEveryOperation();
+  if (plan_result != 0) {
+    return plan_result;
+  }
+  return SequenceLedgerKeepsOnlyBoundedOutstandingState();
 }
