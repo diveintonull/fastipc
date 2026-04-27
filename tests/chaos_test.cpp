@@ -68,6 +68,25 @@ int SequenceLedgerKeepsOnlyBoundedOutstandingState() {
   return 0;
 }
 
+int LatencyWindowsKeepOnlyHeadAndTailSamples() {
+  fastipc::chaos::LatencyWindows windows(32U);
+  constexpr std::size_t kIterations = 1000000U;
+  for (std::size_t index = 0U; index < kIterations; ++index) {
+    windows.Record(static_cast<double>(index));
+  }
+  CHECK(windows.sample_count() == kIterations);
+  CHECK(windows.retained_sample_count() == 64U);
+  const auto baseline = windows.Baseline();
+  const auto final = windows.Final();
+  CHECK(baseline.size() == 32U);
+  CHECK(final.size() == 32U);
+  CHECK(baseline.front() == 0.0);
+  CHECK(baseline.back() == 31.0);
+  CHECK(final.front() == static_cast<double>(kIterations - 32U));
+  CHECK(final.back() == static_cast<double>(kIterations - 1U));
+  return 0;
+}
+
 std::size_t CountOccurrences(
     std::string_view text, std::string_view needle) {
   std::size_t count = 0U;
@@ -125,6 +144,8 @@ int SeededRunProducesExactSummary() {
         std::string::npos);
   CHECK(output.find("\"maximum_outstanding_messages\":3") !=
         std::string::npos);
+  CHECK(output.find("\"retained_probe_samples\":8") !=
+        std::string::npos);
   return 0;
 }
 
@@ -138,5 +159,9 @@ int main(int argc, char** argv) {
   if (plan_result != 0) {
     return plan_result;
   }
-  return SequenceLedgerKeepsOnlyBoundedOutstandingState();
+  const auto ledger_result = SequenceLedgerKeepsOnlyBoundedOutstandingState();
+  if (ledger_result != 0) {
+    return ledger_result;
+  }
+  return LatencyWindowsKeepOnlyHeadAndTailSamples();
 }

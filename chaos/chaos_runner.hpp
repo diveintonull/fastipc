@@ -59,6 +59,30 @@ class SequenceLedger {
   std::size_t maximum_outstanding_count_{0U};
 };
 
+class LatencyWindows {
+ public:
+  explicit LatencyWindows(std::size_t capacity) : capacity_(capacity) {}
+
+  void Record(double sample);
+  [[nodiscard]] std::vector<double> Baseline() const;
+  [[nodiscard]] std::vector<double> Final() const;
+
+  [[nodiscard]] std::size_t sample_count() const noexcept {
+    return sample_count_;
+  }
+  [[nodiscard]] std::size_t retained_sample_count() const noexcept {
+    return baseline_.size() + final_.size();
+  }
+
+ private:
+  [[nodiscard]] std::size_t ComparisonWindowSize() const noexcept;
+
+  std::size_t capacity_{0U};
+  std::size_t sample_count_{0U};
+  std::vector<double> baseline_;
+  std::deque<double> final_;
+};
+
 struct RunnerConfig {
   std::uint64_t seed{20260821U};
   std::size_t minimum_operations{16U};

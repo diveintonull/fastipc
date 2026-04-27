@@ -91,4 +91,36 @@ DeliveryClassification SequenceLedger::RecordConsumed(
   return DeliveryClassification::Ok;
 }
 
+void LatencyWindows::Record(double sample) {
+  ++sample_count_;
+  if (baseline_.size() < capacity_) {
+    baseline_.push_back(sample);
+  }
+  if (capacity_ == 0U) {
+    return;
+  }
+  final_.push_back(sample);
+  if (final_.size() > capacity_) {
+    final_.pop_front();
+  }
+}
+
+std::size_t LatencyWindows::ComparisonWindowSize() const noexcept {
+  return std::min(capacity_, sample_count_ / 2U);
+}
+
+std::vector<double> LatencyWindows::Baseline() const {
+  const auto count = ComparisonWindowSize();
+  return std::vector<double>(
+      baseline_.begin(),
+      baseline_.begin() + static_cast<std::ptrdiff_t>(count));
+}
+
+std::vector<double> LatencyWindows::Final() const {
+  const auto count = ComparisonWindowSize();
+  return std::vector<double>(
+      final_.end() - static_cast<std::ptrdiff_t>(count),
+      final_.end());
+}
+
 }  // namespace fastipc::chaos

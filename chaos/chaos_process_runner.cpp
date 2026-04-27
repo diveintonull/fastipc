@@ -834,7 +834,8 @@ struct Counters {
 
 struct Runner::Impl {
   explicit Impl(RunnerConfig runner_config)
-      : config(std::move(runner_config)) {}
+      : config(std::move(runner_config)),
+        latency_windows(config.latency_window) {}
 
   ~Impl() {
     static_cast<void>(consumer.Stop(config.command_timeout));
@@ -1533,7 +1534,7 @@ struct Runner::Impl {
   EndpointProcess consumer;
   Counters counters;
   SequenceLedger sequence_ledger;
-  std::vector<double> probe_latencies_us;
+  LatencyWindows latency_windows;
   bool has_run{false};
 };
 
@@ -1666,7 +1667,7 @@ Status Runner::Run(std::ostream& output, std::ostream* mirror) {
         status = probe_result.status();
       } else {
         probe_latency = probe_result.value();
-        impl_->probe_latencies_us.push_back(*probe_latency);
+        impl_->latency_windows.Record(*probe_latency);
         if (IsRecoveryOperation(operation)) {
           ++impl_->counters.recovery_count;
         }
@@ -1705,23 +1706,13 @@ Status Runner::Run(std::ostream& output, std::ostream* mirror) {
 
   const auto lost_messages =
       static_cast<std::uint64_t>(impl_->sequence_ledger.outstanding_count());
-  const auto window =
-      std::min(
-          impl_->config.latency_window,
-          impl_->probe_latencies_us.size() / 2U);
+  const auto baseline_window = impl_->latency_windows.Baseline();
+  const auto final_window = impl_->latency_windows.Final();
   double baseline_p99_us = 0.0;
   double final_p99_us = 0.0;
-  if (window > 0U) {
-    baseline_p99_us = Percentile(
-        std::span<const double>(
-            impl_->probe_latencies_us.data(), window),
-        0.99);
-    final_p99_us = Percentile(
-        std::span<const double>(
-            impl_->probe_latencies_us.data() +
-                impl_->probe_latencies_us.size() - window,
-            window),
-        0.99);
+  if (!baseline_window.empty()) {
+    baseline_p99_us = Percentile(baseline_window, 0.99);
+    final_p99_us = Percentile(final_window, 0.99);
   }
   const auto p99_drift_us = final_p99_us - baseline_p99_us;
   std::optional<std::int64_t> memory_growth_kib;
@@ -1793,7 +1784,9 @@ Status Runner::Run(std::ostream& output, std::ostream* mirror) {
           << impl_->sequence_ledger.maximum_outstanding_count()
           << ",\"actual_duration_ms\":" << duration_ms
           << ",\"probe_samples\":"
-          << impl_->probe_latencies_us.size()
+          << impl_->latency_windows.sample_count()
+          << ",\"retained_probe_samples\":"
+          << impl_->latency_windows.retained_sample_count()
           << ",\"baseline_p99_us\":" << baseline_p99_us
           << ",\"final_p99_us\":" << final_p99_us
           << ",\"p99_drift_us\":" << p99_drift_us
