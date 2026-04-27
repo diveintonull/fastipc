@@ -50,6 +50,20 @@ int DeterministicPlanCoversEveryOperation() {
   return 0;
 }
 
+int StreamingPlanMatchesBatchPlanWithBoundedState() {
+  constexpr std::uint64_t kSeed = 20260821U;
+  const auto expected = fastipc::chaos::GenerateOperationPlan(kSeed, 4096U);
+  fastipc::chaos::OperationPlanGenerator generator(kSeed);
+  for (const auto operation : expected) {
+    CHECK(generator.Next() == operation);
+  }
+  for (std::size_t index = expected.size(); index < 1000000U; ++index) {
+    static_cast<void>(generator.Next());
+  }
+  CHECK(generator.retained_operation_count() == 8U);
+  return 0;
+}
+
 int SequenceLedgerKeepsOnlyBoundedOutstandingState() {
   fastipc::chaos::SequenceLedger ledger;
   constexpr std::size_t kIterations = 1000000U;
@@ -146,6 +160,8 @@ int SeededRunProducesExactSummary() {
         std::string::npos);
   CHECK(output.find("\"retained_probe_samples\":8") !=
         std::string::npos);
+  CHECK(output.find("\"retained_plan_operations\":8") !=
+        std::string::npos);
   return 0;
 }
 
@@ -158,6 +174,11 @@ int main(int argc, char** argv) {
   const auto plan_result = DeterministicPlanCoversEveryOperation();
   if (plan_result != 0) {
     return plan_result;
+  }
+  const auto streaming_plan_result =
+      StreamingPlanMatchesBatchPlanWithBoundedState();
+  if (streaming_plan_result != 0) {
+    return streaming_plan_result;
   }
   const auto ledger_result = SequenceLedgerKeepsOnlyBoundedOutstandingState();
   if (ledger_result != 0) {

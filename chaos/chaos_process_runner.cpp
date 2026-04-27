@@ -1644,21 +1644,13 @@ Status Runner::Run(std::ostream& output, std::ostream* mirror) {
   const auto rss_start = impl_->TotalRssKiB();
   auto maximum_rss = rss_start;
   const auto run_start = Clock::now();
-  const auto initial_plan_size =
-      std::max<std::size_t>(
-          8U, impl_->config.minimum_operations);
-  auto plan = GenerateOperationPlan(
-      impl_->config.seed, initial_plan_size);
+  OperationPlanGenerator plan(impl_->config.seed);
 
   std::size_t operation_index = 0U;
   while (operation_index < impl_->config.minimum_operations ||
          Clock::now() - run_start <
              impl_->config.minimum_duration) {
-    if (operation_index >= plan.size()) {
-      plan = GenerateOperationPlan(
-          impl_->config.seed, plan.size() + 8U);
-    }
-    const auto operation = plan[operation_index];
+    const auto operation = plan.Next();
     status = impl_->Perform(operation);
     std::optional<double> probe_latency;
     if (status) {
@@ -1782,6 +1774,8 @@ Status Runner::Run(std::ostream& output, std::ostream* mirror) {
           << ",\"sequence_tracker_mode\":\"contiguous_fifo\""
           << ",\"maximum_outstanding_messages\":"
           << impl_->sequence_ledger.maximum_outstanding_count()
+          << ",\"retained_plan_operations\":"
+          << plan.retained_operation_count()
           << ",\"actual_duration_ms\":" << duration_ms
           << ",\"probe_samples\":"
           << impl_->latency_windows.sample_count()

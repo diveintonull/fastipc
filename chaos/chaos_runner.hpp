@@ -1,12 +1,14 @@
 #pragma once
 
 #include <chrono>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -27,6 +29,21 @@ enum class Operation : std::uint8_t {
 };
 
 [[nodiscard]] std::string_view ToString(Operation operation) noexcept;
+
+class OperationPlanGenerator {
+ public:
+  explicit OperationPlanGenerator(std::uint64_t seed);
+
+  [[nodiscard]] Operation Next();
+  [[nodiscard]] std::size_t retained_operation_count() const noexcept {
+    return cycle_.size();
+  }
+
+ private:
+  std::mt19937_64 random_;
+  std::array<Operation, 8U> cycle_;
+  std::size_t next_index_{8U};
+};
 
 [[nodiscard]] std::vector<Operation> GenerateOperationPlan(
     std::uint64_t seed, std::size_t operation_count);

@@ -1,9 +1,7 @@
 #include "chaos/chaos_runner.hpp"
 
 #include <algorithm>
-#include <array>
 #include <limits>
-#include <random>
 
 namespace fastipc::chaos {
 
@@ -29,29 +27,34 @@ std::string_view ToString(Operation operation) noexcept {
   return "Unknown";
 }
 
+OperationPlanGenerator::OperationPlanGenerator(std::uint64_t seed)
+    : random_(seed),
+      cycle_{
+          Operation::KillProducer,
+          Operation::KillConsumer,
+          Operation::RestartProducer,
+          Operation::RestartConsumer,
+          Operation::SlowConsumer,
+          Operation::QueuePressure,
+          Operation::Timeout,
+          Operation::DelayWakeup,
+      } {}
+
+Operation OperationPlanGenerator::Next() {
+  if (next_index_ >= cycle_.size()) {
+    std::shuffle(cycle_.begin(), cycle_.end(), random_);
+    next_index_ = 0U;
+  }
+  return cycle_[next_index_++];
+}
+
 std::vector<Operation> GenerateOperationPlan(
     std::uint64_t seed, std::size_t operation_count) {
-  constexpr std::array<Operation, 8U> kAllOperations{
-      Operation::KillProducer,
-      Operation::KillConsumer,
-      Operation::RestartProducer,
-      Operation::RestartConsumer,
-      Operation::SlowConsumer,
-      Operation::QueuePressure,
-      Operation::Timeout,
-      Operation::DelayWakeup,
-  };
-
-  std::mt19937_64 random(seed);
+  OperationPlanGenerator generator(seed);
   std::vector<Operation> plan;
   plan.reserve(operation_count);
-  while (plan.size() < operation_count) {
-    auto cycle = kAllOperations;
-    std::shuffle(cycle.begin(), cycle.end(), random);
-    const auto remaining = operation_count - plan.size();
-    const auto count = std::min(remaining, cycle.size());
-    plan.insert(plan.end(), cycle.begin(),
-                cycle.begin() + static_cast<std::ptrdiff_t>(count));
+  for (std::size_t index = 0U; index < operation_count; ++index) {
+    plan.push_back(generator.Next());
   }
   return plan;
 }

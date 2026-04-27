@@ -61,7 +61,7 @@ DelayWakeup
 3. 不同 seed 通常得到不同顺序；
 4. seed 只复现操作顺序，不承诺复现 kernel scheduling interleaving。
 
-时长模式会持续按相同 seed 扩展 8 操作周期。summary 记录最终 `operation_count`；诊断时可用同一 seed 和该 count 去掉 duration 下限，重放相同操作顺序。
+时长模式用同一 PRNG 流式生成周期，只保留当前 8 个操作，不保存或重建全历史 plan。summary 记录最终 `operation_count`；诊断时可用同一 seed 和该 count 去掉 duration 下限，重放相同操作顺序。
 
 ## 八类操作的故障点
 
@@ -119,9 +119,10 @@ cleanup_failures
 actual_duration_ms
 sequence_tracker_mode
 maximum_outstanding_messages
-baseline_p99_us
+retained_plan_operations
 probe_samples
 retained_probe_samples
+baseline_p99_us
 final_p99_us
 p99_drift_us
 rss_start_kib
@@ -130,7 +131,7 @@ maximum_rss_kib
 memory_growth_kib
 ```
 
-RSS 读取 `/proc/<pid>/statm` 的 resident pages 并汇总父进程和两个 actor。Sequence ledger 的存储上限由当前 outstanding 数决定；summary 同时输出观测到的最大值，避免 runner 自己用全历史集合制造伪内存增长。Latency tracker 只保留最早 N 与最近 N 个探针，`probe_samples` 记录总数，`retained_probe_samples` 最多为 `2N`。RSS 仍只适合发现明显无界增长，不是 allocator leak proof；ASan/LSan 需独立运行。baseline/final P99 分别取探针序列首尾窗口；短跑样本少，因此只能用于回归门槛，不能做容量规划。
+RSS 读取 `/proc/<pid>/statm` 的 resident pages 并汇总父进程和两个 actor。Plan generator 固定保留 8 个操作；Sequence ledger 的存储上限由当前 outstanding 数决定；Latency tracker 只保留最早 N 与最近 N 个探针，`probe_samples` 记录总数，`retained_probe_samples` 最多为 `2N`。这些字段避免 runner 自己用全历史集合制造伪内存增长。RSS 仍只适合发现明显无界增长，不是 allocator leak proof；ASan/LSan 需独立运行。baseline/final P99 分别取探针序列首尾窗口；短跑样本少，因此只能用于回归门槛，不能做容量规划。
 
 ## 通过条件与退出码
 
