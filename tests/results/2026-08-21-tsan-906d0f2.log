@@ -1,0 +1,108 @@
+-- The CXX compiler identification is GNU 13.3.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE  
+-- Configuring done (2.9s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/phil/job/new/projects/fastipc/build-chaos-906d0f2-tsan
+[1/25] Building CXX object CMakeFiles/fastipc.dir/src/mpmc_shared_memory_transport.cpp.o
+[2/25] Building CXX object CMakeFiles/fastipc.dir/src/shared_memory_transport.cpp.o
+[3/25] Building CXX object CMakeFiles/fastipc.dir/src/status.cpp.o
+[4/25] Building CXX object CMakeFiles/fastipc.dir/src/unix_domain_socket_transport.cpp.o
+[5/25] Linking CXX static library libfastipc.a
+[6/25] Building CXX object CMakeFiles/fastipc_benchmark.dir/benchmarks/benchmark_main.cpp.o
+[7/25] Building CXX object CMakeFiles/fastipc_benchmark.dir/benchmarks/benchmark_runner.cpp.o
+[8/25] Linking CXX executable fastipc_benchmark
+[9/25] Building CXX object CMakeFiles/fastipc_mpmc_benchmark.dir/benchmarks/mpmc_contention_main.cpp.o
+[10/25] Linking CXX executable fastipc_mpmc_benchmark
+[11/25] Building CXX object CMakeFiles/fastipc_chaos_support.dir/chaos/chaos_runner.cpp.o
+[12/25] Building CXX object CMakeFiles/fastipc_chaos_support.dir/chaos/chaos_process_runner.cpp.o
+[13/25] Linking CXX static library libfastipc_chaos_support.a
+[14/25] Building CXX object CMakeFiles/fastipc_chaos_runner.dir/chaos/chaos_main.cpp.o
+[15/25] Linking CXX executable fastipc_chaos_runner
+[16/25] Building CXX object CMakeFiles/fastipc_tests.dir/tests/transport_test.cpp.o
+[17/25] Building CXX object CMakeFiles/fastipc_zero_copy_tests.dir/tests/zero_copy_test.cpp.o
+[18/25] Linking CXX executable fastipc_tests
+[19/25] Linking CXX executable fastipc_zero_copy_tests
+[20/25] Building CXX object CMakeFiles/fastipc_mpmc_tests.dir/tests/mpmc_test.cpp.o
+[21/25] Linking CXX executable fastipc_mpmc_tests
+[22/25] Building CXX object CMakeFiles/fastipc_uds_tests.dir/tests/unix_domain_socket_test.cpp.o
+[23/25] Linking CXX executable fastipc_uds_tests
+[24/25] Building CXX object CMakeFiles/fastipc_chaos_tests.dir/tests/chaos_test.cpp.o
+[25/25] Linking CXX executable fastipc_chaos_tests
+Internal ctest changing into directory: /home/phil/job/new/projects/fastipc/build-chaos-906d0f2-tsan
+Test project /home/phil/job/new/projects/fastipc/build-chaos-906d0f2-tsan
+      Start  1: fastipc.transport
+ 1/30 Test  #1: fastipc.transport ........................   Passed    1.41 sec
+      Start  2: fastipc.zero_copy
+ 2/30 Test  #2: fastipc.zero_copy ........................   Passed    0.28 sec
+      Start  3: fastipc.zero_copy.no_allocation
+ 3/30 Test  #3: fastipc.zero_copy.no_allocation ..........   Passed    0.02 sec
+      Start  4: fastipc.fault.producer_loan_crash
+ 4/30 Test  #4: fastipc.fault.producer_loan_crash ........   Passed    0.02 sec
+      Start  5: fastipc.fault.consumer_sample_crash
+ 5/30 Test  #5: fastipc.fault.consumer_sample_crash ......   Passed    0.02 sec
+      Start  6: fastipc.fault.outstanding_handle_close
+ 6/30 Test  #6: fastipc.fault.outstanding_handle_close ...   Passed    0.02 sec
+      Start  7: fastipc.fault.producer_paused_takeover
+ 7/30 Test  #7: fastipc.fault.producer_paused_takeover ...   Passed    0.11 sec
+      Start  8: fastipc.fault.consumer_paused_takeover
+ 8/30 Test  #8: fastipc.fault.consumer_paused_takeover ...   Passed    0.11 sec
+      Start  9: fastipc.mpmc
+ 9/30 Test  #9: fastipc.mpmc .............................   Passed    0.38 sec
+      Start 10: fastipc.mpmc.threaded_exactly_once
+10/30 Test #10: fastipc.mpmc.threaded_exactly_once .......   Passed    0.27 sec
+      Start 11: fastipc.mpmc.process_exactly_once
+11/30 Test #11: fastipc.mpmc.process_exactly_once ........   Passed    0.01 sec
+      Start 12: fastipc.mpmc.abandoned_reservation
+12/30 Test #12: fastipc.mpmc.abandoned_reservation .......   Passed    0.04 sec
+      Start 13: fastipc.uds
+13/30 Test #13: fastipc.uds ..............................   Passed    0.13 sec
+      Start 14: fastipc.chaos.plan
+14/30 Test #14: fastipc.chaos.plan .......................   Passed    0.42 sec
+      Start 15: fastipc.chaos.summary
+15/30 Test #15: fastipc.chaos.summary ....................   Passed    0.08 sec
+      Start 16: fastipc.chaos.seeded_smoke
+16/30 Test #16: fastipc.chaos.seeded_smoke ...............   Passed    0.08 sec
+      Start 17: fastipc.benchmark_smoke
+17/30 Test #17: fastipc.benchmark_smoke ..................   Passed    1.65 sec
+      Start 18: fastipc.mpmc.benchmark_smoke
+18/30 Test #18: fastipc.mpmc.benchmark_smoke .............   Passed    0.04 sec
+      Start 19: fastipc.fault.peer_missing
+19/30 Test #19: fastipc.fault.peer_missing ...............   Passed    0.01 sec
+      Start 20: fastipc.fault.producer_crash
+20/30 Test #20: fastipc.fault.producer_crash .............   Passed    0.01 sec
+      Start 21: fastipc.fault.consumer_crash
+21/30 Test #21: fastipc.fault.consumer_crash .............   Passed    0.01 sec
+      Start 22: fastipc.fault.restart
+22/30 Test #22: fastipc.fault.restart ....................   Passed    0.01 sec
+      Start 23: fastipc.fault.slow_consumer
+23/30 Test #23: fastipc.fault.slow_consumer ..............   Passed    0.03 sec
+      Start 24: fastipc.fault.timeout
+24/30 Test #24: fastipc.fault.timeout ....................   Passed    0.04 sec
+      Start 25: fastipc.fault.malformed_header
+25/30 Test #25: fastipc.fault.malformed_header ...........   Passed    0.01 sec
+      Start 26: fastipc.fault.version_mismatch
+26/30 Test #26: fastipc.fault.version_mismatch ...........   Passed    0.01 sec
+      Start 27: fastipc.fault.stale_shared_memory
+27/30 Test #27: fastipc.fault.stale_shared_memory ........   Passed    0.31 sec
+      Start 28: fastipc.fault.queue_full
+28/30 Test #28: fastipc.fault.queue_full .................   Passed    0.04 sec
+      Start 29: fastipc.fault.queue_empty
+29/30 Test #29: fastipc.fault.queue_empty ................   Passed    0.03 sec
+      Start 30: fastipc.fault.rapid_restart
+30/30 Test #30: fastipc.fault.rapid_restart ..............   Passed    0.02 sec
+
+100% tests passed, 0 tests failed out of 30
+
+Label Time Summary:
+benchmark    =   1.69 sec*proc (2 tests)
+chaos        =   0.58 sec*proc (3 tests)
+fault        =   1.03 sec*proc (20 tests)
+
+Total Test time (real) =   5.66 sec

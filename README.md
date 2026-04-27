@@ -266,5 +266,5 @@ does not yet provide full robust recovery.
 - 没有 authentication、encryption、namespace broker、SELinux policy integration、NUMA placement 或 real-time scheduling guarantee。
 - UDS sealed-memfd 是 descriptor-assisted shared memory，不是 pure socket-copy throughput。
 - iceoryx baseline 当前为 INCOMPLETE；依赖和专用 adapter 都可复核前不得产生数值结果。
-- 30 分钟、2 小时、overnight 与 24 小时 soak 必须分别保留固定 revision 原始 JSONL 才能声称完成；短 CTest 不等于长时稳定性。
+- revision `906d0f2` 的 30 分钟 seeded soak 已保存完整压缩 JSONL、summary 和退出码并通过；2 小时、overnight 与 24 小时仍为 **INCOMPLETE**，短 CTest 和 30 分钟结果都不能替代更长阶段。
 - 部署决策前必须在 native Linux 与 target hardware 重测 WSL2 数据。

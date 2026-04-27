@@ -43,6 +43,8 @@
 
 每个完整 8 操作周期都是八类操作的 seed-shuffled permutation。相同 seed 和 operation count 产生相同操作顺序；Linux 调度时序不因此变成 deterministic。逐行证据与长时边界见 [chaos-testing.md](chaos-testing.md)。
 
+revision `906d0f2` 的 30 分钟 seed `20260821` 运行完成 168,954 次操作且正确性错误为 0；2 小时、overnight 和 24 小时仍为 `INCOMPLETE`。原始证据与 summary 见 [测试矩阵](../TEST_MATRIX.md#2026-08-21-seeded-chaos--soak-增量验证)。
+
 当前 `fault` 标签共有 20 个 registered entry：17 个 SPSC/零拷贝直接故障、1 个 MPMC abandoned-reservation 限制测试、`fastipc.chaos.summary` 与 `fastipc.chaos.seeded_smoke`。Chaos 两项会串行覆盖八类操作，不能把它们再按“八个独立 CTest”相加。
 
 ## 复现

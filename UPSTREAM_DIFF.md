@@ -94,6 +94,10 @@ Chaos support 只链接 public `FastIPC::fastipc` 并位于 `chaos/`；匿名 pi
 | `f5aed21` 至 `c8c73d6` | baseline profiling 与两项 measured optimization |
 | `c7cac63` | 五配置 build/sanitizer verification |
 | `31b2107` | active-operation lease 与真实 crash/restart data-flow regression |
+| `3209677` | 独立 producer/consumer 的 seeded chaos runner、八操作 oracle 与增量 JSONL |
+| `ddebe62` | 用连续 FIFO ledger 替换全历史 sequence set，使消息跟踪仅随 outstanding 有界 |
+| `c81dc57` | 用首尾窗口替换全历史 latency vector，同时保留总探针计数 |
+| `906d0f2` | 时长模式改为流式 8 操作 plan generator，消除全计划保存和二次生成 |
 
 在测试版本 `31b2107`，`git diff --shortstat fe161d2:projects/fastipc 31b2107:projects/fastipc` 报告 55 个文件变化、8,740 行新增、635 行删除。它只是评审辅助数据，不是作者占比：生成的测量记录和文档在差异内，保留历史文件在差异外。
 

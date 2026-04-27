@@ -202,7 +202,28 @@ fastipc_chaos_runner --operations 0 --duration-ms 28800000 ...
 3. summary 与进程退出码；
 4. sanitizer 矩阵作为独立证据。
 
-当前实现提交前只完成开发阶段短测；正式 30 分钟、2 小时、overnight 和 24 小时结果在原始证据落库前一律为 `INCOMPLETE`。24 小时只在前面阶段稳定后运行，也不能代替可复现 seed、逐操作日志和失败定位。
+revision `906d0f2d88fb4af504377a4f35f69381ca773366` 已完成一轮真实 30 分钟运行：
+
+| 阶段 | 状态 | 结果 |
+| --- | --- | --- |
+| 30 分钟 | **PASSED** | 168,954 操作；42,238 crash；84,476 restart/recovery；正确性错误 0；实际 1,800,004.052 ms |
+| 2 小时 | **INCOMPLETE** | 未运行，不能从 30 分钟结果外推 |
+| overnight（8 小时） | **INCOMPLETE** | 未运行 |
+| 24 小时 | **INCOMPLETE** | 只在前述阶段稳定后考虑 |
+
+本轮显式传入 64 MiB RSS 增长门槛和 5 ms P99 漂移门槛。summary 记录 RSS 增长 208 KiB，恢复探针 P99 从 189.500 µs 到 186.844 µs，漂移 -2.656 µs，两个门槛都未超过。完整原始 JSONL 无损压缩为 [证据文件](../tests/results/2026-08-21-chaos-seed-20260821-30min-906d0f2.jsonl.gz)：
+
+```text
+原始字节数: 69,633,384
+原始 SHA-256: 51e70f47b663a8db01b3972578cb5f6137c9210e6a2495cb9adf8038b5672728
+gzip 字节数: 2,305,656
+gzip SHA-256: 356107ea33e8c660d7f148988e76ce992c2276696d196da5d754dc5db8767c58
+stderr 字节数: 0
+```
+
+`gzip -t` 已通过，解压流重新计算得到同一原始 SHA-256；进程自然退出码为 0。逐项 summary、五配置 150/150 矩阵和固定 seed 重放哈希见 [TEST_MATRIX.md](../TEST_MATRIX.md)。
+
+30 分钟通过不代表 2 小时、overnight 或 24 小时已完成，也不等于 target hardware 生产稳定性。24 小时不能代替可复现 seed、逐操作日志和失败定位。
 
 ## 已知限制
 

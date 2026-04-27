@@ -185,3 +185,116 @@ benchmark smoke 机器校验 environment/baseline/result record 数、统一 run
 TSan 在本机继续用 `setarch x86_64 -R` 避免 WSL2 shadow-memory mapping 冲突；这是运行环境包装，不是数据竞争 suppression。
 
 `abandoned_reservation` 是失败语义表征：它证明当前会产生队首阻塞，也证明实现没有假装跳过或回收未发布 slot。它不证明 crash recovery；完整 robust recovery 仍为 `INCOMPLETE`。
+
+## 2026-08-21 Seeded Chaos / Soak 增量验证
+
+本节先记录 revision `906d0f2d88fb4af504377a4f35f69381ca773366` 上已经终结的构建矩阵和固定操作数短跑。30 分钟时长运行只有在进程正常退出、summary 通过且完整原始证据封存后才会在下文标为完成。
+
+| 字段 | 值 |
+| --- | --- |
+| 主机 / 内核 | WSL2 / `6.6.87.2-microsoft-standard-WSL2` |
+| 编译器 | GNU 13.3.0 |
+| 构建 | fresh Ninja；Debug、Release、ASan、UBSan、TSan |
+| CTest | 每种配置 30 项；`fault` 标签 20 项，`chaos` 标签 3 项 |
+| 合计 | 150/150 |
+
+| 配置 | Sanitizer 参数 | 通过 | 失败 | 原始日志 | SHA-256 |
+| --- | --- | ---: | ---: | --- | --- |
+| Debug | 无 | 30 | 0 | [日志](tests/results/2026-08-21-debug-906d0f2.log) | `0017ac624353f03f43995ca8948bd07010a16c279149dc21bb320baf9131ed6d` |
+| Release | 无 | 30 | 0 | [日志](tests/results/2026-08-21-release-906d0f2.log) | `84b781a752f1238aff17ead163ad0a2c23366a93bc4b526ad9f3b3a25c2ef517` |
+| ASan | `detect_leaks=1:halt_on_error=1` | 30 | 0 | [日志](tests/results/2026-08-21-asan-906d0f2.log) | `27bc4c4efee034147a838627ce685b126a7df83fa87e9731007442f290894793` |
+| UBSan | `halt_on_error=1:print_stacktrace=1` | 30 | 0 | [日志](tests/results/2026-08-21-ubsan-906d0f2.log) | `635ec6ea951d3f21f8a1456d71eb987cf544d4ef21d66358cbc5d3954380c1f5` |
+| TSan | `halt_on_error=1:second_deadlock_stack=1` | 30 | 0 | [日志](tests/results/2026-08-21-tsan-906d0f2.log) | `449f76be2575ce28d96bf76b4807e88cab57c97051548f032c04c68579a6cef5` |
+
+五份日志均恰好包含一次 `100% tests passed, 0 tests failed out of 30`。额外扫描未发现编译 warning、FAILED、断言失败、ASan/LSan、UBSan runtime error 或 TSan data-race 诊断。TSan 继续使用 `setarch x86_64 -R` 规避该 WSL2 的 shadow-memory mapping collision，不使用 suppression。
+
+### 固定 seed 的可复现短跑
+
+执行参数：
+
+```bash
+fastipc_chaos_runner \
+  --seed 20260821 \
+  --operations 256 \
+  --payload 4096 \
+  --slot-count 8 \
+  --peer-timeout-ms 50 \
+  --command-timeout-ms 2500 \
+  --delay-ms 20 \
+  --latency-window 64
+```
+
+同一 revision 和参数独立执行两次；从两份 JSONL 提取 256 个 `record_type=operation` 的操作名后，`cmp` 退出码为 0。非空操作序列 SHA-256 为：
+
+```text
+ed38acba51ce0aa4c58526fd78344d4d9d9cf172dc9c2bfa33d05fb1d9d6cc8a
+```
+
+八类操作各出现 32 次。canonical [JSONL](tests/results/2026-08-21-chaos-seed-20260821-ops-256-906d0f2.jsonl) 的 SHA-256 为 `fc1c46fef156a914836cf1119fb31623e9d12c80ff0cef1f4e80f54fa5c2c873`，summary 为：
+
+| 指标 | 结果 |
+| --- | ---: |
+| operation / crash / restart / recovery | 256 / 64 / 128 / 128 |
+| checksum / lost / duplicate / unexpected message | 0 / 0 / 0 / 0 |
+| expected / unexpected timeout | 64 / 0 |
+| expected drop / operation failure / cleanup failure | 32 / 0 / 0 |
+| maximum outstanding / retained plan | 9 / 8 |
+| probe / retained probe | 256 / 128 |
+| baseline / final P99 / drift | 185.391 / 215.030 / 29.639 µs |
+| RSS start / end / maximum / growth | 9,416 / 9,216 / 9,608 / -200 KiB |
+| status / duration | passed / 2,743.441 ms |
+
+该短跑只证明固定 seed 操作计划可复现和自动化不变量通过，不等价于长时稳定性。
+
+### 30 分钟真实 soak
+
+固定 revision 的 fresh Release binary 执行：
+
+```bash
+fastipc_chaos_runner \
+  --seed 20260821 \
+  --operations 0 \
+  --duration-ms 1800000 \
+  --payload 4096 \
+  --slot-count 8 \
+  --peer-timeout-ms 50 \
+  --command-timeout-ms 2500 \
+  --delay-ms 20 \
+  --latency-window 4096 \
+  --max-memory-growth-kib 65536 \
+  --max-p99-drift-us 5000
+```
+
+进程自然退出且退出码为 0。完整逐操作证据以无时间戳 gzip 保存为 [JSONL.gz](tests/results/2026-08-21-chaos-seed-20260821-30min-906d0f2.jsonl.gz)，stderr 为 [0 字节日志](tests/results/2026-08-21-chaos-seed-20260821-30min-906d0f2.stderr.log)。
+
+| 指标 | 结果 |
+| --- | ---: |
+| operation / crash / restart / recovery | 168,954 / 42,238 / 84,476 / 84,476 |
+| checksum / lost / duplicate / unexpected message | 0 / 0 / 0 / 0 |
+| expected / unexpected timeout | 42,239 / 0 |
+| expected drop / operation failure / cleanup failure | 21,119 / 0 / 0 |
+| maximum outstanding / retained plan | 9 / 8 |
+| probe / retained probe | 168,954 / 8,192 |
+| baseline / final P99 / drift | 189.500 / 186.844 / -2.656 µs |
+| RSS start / end / maximum / growth | 9,608 / 9,816 / 9,824 / 208 KiB |
+| status / duration | passed / 1,800,004.052 ms |
+| 64 MiB RSS / 5 ms P99 门槛 | 均未超过 |
+
+静止文件上的机器校验结果：
+
+- 168,956 行恰好由 1 条 environment、168,954 条 operation 和 1 条 summary 构成；
+- `status=ok` 恰好 168,954 条，`status=error` 为 0；
+- stderr 为 0 字节；
+- runner 父进程在 69,154 和 163,939 次操作附近均为 9 个 FD，未随 actor 重启次数增长；
+- 原始 JSONL 为 69,633,384 字节，SHA-256 为 `51e70f47b663a8db01b3972578cb5f6137c9210e6a2495cb9adf8038b5672728`；
+- gzip 为 2,305,656 字节，SHA-256 为 `356107ea33e8c660d7f148988e76ce992c2276696d196da5d754dc5db8767c58`；
+- `gzip -t` 通过，`gzip -dc | sha256sum` 重新得到原始 SHA-256。
+
+[SHA-256 清单](tests/results/2026-08-21-chaos-evidence-906d0f2.sha256) 可直接在 `tests/results` 目录用 `sha256sum -c` 复核。
+
+| 阶段 | 状态 | 边界 |
+| --- | --- | --- |
+| 30 分钟 | **PASSED** | 上述固定 revision、seed、命令、JSONL、summary 和退出码均已保存 |
+| 2 小时 | **INCOMPLETE** | 未运行，不从 30 分钟结果外推 |
+| overnight（8 小时） | **INCOMPLETE** | 未运行 |
+| 24 小时 | **INCOMPLETE** | 只在前述阶段稳定后考虑 |
