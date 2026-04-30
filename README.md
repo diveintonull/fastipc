@@ -2,8 +2,6 @@
 
 FastIPC 是 Linux C++20 IPC library，基于 `kyr0/libsharedmemory` 深度派生并明确标注来源。当前 core 提供 versioned SPSC zero-copy channel、独立的 bounded MPMC copy channel、带 absolute deadline 的 futex blocking、peer liveness/restart fencing、显式 backpressure，以及 Unix Domain Socket transport。
 
-FastIPC 当前尚未经过生产环境 security review，已验证范围以本仓库记录的测试、benchmark 与审计证据为准。
-
 ## 能力
 
 - Linux POSIX shared-memory mapping，带 creator/open validation，默认 mode 0600；
