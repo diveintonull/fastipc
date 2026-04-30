@@ -110,4 +110,4 @@ compiled core 没有两者源码。以后若真正 copy/adapt code，而非只�
 
 ## 明确不作的声明
 
-FastIPC 不声称 MPSC、fan-out、MPMC abandoned-reservation crash recovery、portable ISO C++ process-shared atomic、authentication/encryption、hard real-time latency、任意指令点 crash-proof recovery、production security review，也不把 WSL2 短测或性能结果当成 native-hardware 长时稳定性。这些是明确边界，不是暗示存在的能力。
+FastIPC 不声称 MPSC、fan-out、MPMC abandoned-reservation crash recovery、portable ISO C++ process-shared atomic、authentication/encryption、hard real-time latency、任意指令点 crash-proof recovery，也不把 WSL2 短测或性能结果当成 native-hardware 长时稳定性。这些是明确边界，不是暗示存在的能力。
