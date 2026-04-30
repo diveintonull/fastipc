@@ -35,7 +35,7 @@
 
 `transport_only` 只写/读前 8 B sequence；表中 MiB/s 是按逻辑 payload 大小换算的 transport capacity，不表示应用真的读写了整块 payload。
 
-| Payload | Copy MiB/s | Copy P99 �s | Zero-copy MiB/s | Zero P99 �s | UDS MiB/s | UDS P99 �s | Pipe MiB/s | Pipe P99 �s |
+| Payload | Copy MiB/s | Copy P99 µs | Zero-copy MiB/s | Zero P99 µs | UDS MiB/s | UDS P99 µs | Pipe MiB/s | Pipe P99 µs |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 64 B | 7.781 | 54.258 | 6.007 | 63.114 | 3.415 | 90.064 | 3.855 | 79.054 |
 | 256 B | 31.878 | 53.059 | 24.055 | 77.689 | 14.974 | 86.489 | 17.109 | 70.494 |
@@ -50,7 +50,7 @@
 
 `touch_memory` 要求 producer 写完整 payload、consumer 逐字节读并验证完整 payload，更接近“应用实际使用消息内容”的成本边界。
 
-| Payload | Copy MiB/s | Copy P99 �s | Zero-copy MiB/s | Zero P99 �s | UDS MiB/s | UDS P99 �s | Pipe MiB/s | Pipe P99 �s |
+| Payload | Copy MiB/s | Copy P99 µs | Zero-copy MiB/s | Zero P99 µs | UDS MiB/s | UDS P99 µs | Pipe MiB/s | Pipe P99 µs |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 64 B | 5.998 | 67.669 | 5.548 | 68.972 | 4.040 | 70.524 | 3.630 | 89.011 |
 | 256 B | 16.798 | 85.446 | 17.784 | 75.180 | 14.092 | 83.939 | 14.677 | 85.927 |

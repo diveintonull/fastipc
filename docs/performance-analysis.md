@@ -53,12 +53,12 @@ producer 写满，consumer 扫描并验证全部 payload。此时应用内存访
 
 | Payload | Zero/copy 吞吐比 | Zero/copy P99 比 |
 | ---: | ---: | ---: |
-| 64 B | 0.925� | 1.019� |
-| 256 B | 1.059� | 0.880� |
-| 1 KiB | 1.000� | 0.966� |
-| 4 KiB | 0.934� | 1.019� |
-| 64 KiB | 1.078� | 0.932� |
-| 1 MiB | 1.103� | 0.835� |
+| 64 B | 0.925× | 1.019× |
+| 256 B | 1.059× | 0.880× |
+| 1 KiB | 1.000× | 0.966× |
+| 4 KiB | 0.934× | 1.019× |
+| 64 KiB | 1.078× | 0.932× |
+| 1 MiB | 1.103× | 0.835× |
 
 数值不是单调曲线，说明 scheduler、cache state 和扫描循环噪声仍显著。可以说“本机 64 KiB/1 MiB 显示收益”，不能说“4 KiB 是普适 break-even”。
 
@@ -66,7 +66,7 @@ producer 写满，consumer 扫描并验证全部 payload。此时应用内存访
 
 最明显的例子是 1 MiB zero-copy `transport_only`：
 
-| Trial | MiB/s | P50 RTT �s | P99 RTT �s | CPU % | Context switch |
+| Trial | MiB/s | P50 RTT µs | P99 RTT µs | CPU % | Context switch |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1 | 56,641.306 | 33.969 | 69.030 | 60.111 | 2,000 |
 | 2 | 92,353.521 | 22.630 | 58.327 | 71.902 | 1,591 |
